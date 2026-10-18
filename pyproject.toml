@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mlbridge-local"
+version = "0.1.1"
+description = "Non-invasive external workspace and Colab worker adapter"
+requires-python = ">=3.11"
+authors = [{name = "MLBridge prototype"}]
+license = {text = "MIT"}
+dependencies = []
+
+[project.scripts]
+mlbridge = "mlbridge.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,6 @@
+# 安装时放在 ~/.config/mlbridge/settings.toml
+[storage]
+remote = "gdrive"            # 已经认证的 rclone remote 名称
+prefix = "mlbridge"          # 每个 project 分离一个 restic 仓库
+password_file = "/home/user/.config/mlbridge/restic-password"
+rclone_config = "/home/user/.config/rclone/rclone.conf"

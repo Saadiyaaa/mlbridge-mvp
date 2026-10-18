@@ -1,0 +1,15 @@
+# 这份文件安装时放在 ~/.config/mlbridge/projects/<name>.toml
+# 必须保持在现有研究项目以外。
+name = "image-project"
+workspace = "/home/user/projects/image-project"
+repository = "https://github.com/example/image-project.git"
+
+[jobs.upstream]
+command = ["python", "upstream.py", "--input", "data/raw", "--output", "outputs/upstream"]
+setup = [["python", "-m", "pip", "install", "-r", "requirements.txt"]]
+outputs = ["outputs/upstream"]
+
+[jobs.downstream]
+command = ["python", "downstream.py", "--input", "outputs/upstream", "--output", "outputs/downstream"]
+setup = [["python", "-m", "pip", "install", "-r", "requirements.txt"]]
+outputs = ["outputs/downstream", "checkpoints"]
