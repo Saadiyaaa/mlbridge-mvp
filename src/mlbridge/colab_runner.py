@@ -120,8 +120,9 @@ def launch(name: str, job: str, inputs: list[str], gpu: str,
     commit = git_commit(root, allow_dirty)
     if not inputs and not allow_empty_input:
         raise BridgeError('需要至少一个 --input 快照；无输入任务请显式使用 --allow-empty-input')
-    if gpu not in ('T4', 'L4', 'A100', 'H100', 'G4'):
-        raise BridgeError('GPU 参数无效')
+    gpu_norm = gpu.upper()
+    if gpu_norm not in ('T4', 'L4', 'A100', 'H100', 'G4', 'CPU', 'NONE'):
+        raise BridgeError('GPU 参数无效，支持: T4, L4, A100, H100, G4, CPU (或 none)')
     session = session or f'mlb-{name[:30]}-{secrets.token_hex(4)}'
     if not SESSION.fullmatch(session):
         raise BridgeError('session ID 不合法或太长')
@@ -129,8 +130,12 @@ def launch(name: str, job: str, inputs: list[str], gpu: str,
                 repository=cfg['repository'], commit=commit,
                 restic_repository=repo_url(name, store),
                 inputs=inputs, **spec)
-    print(f'[mlbridge] Colab 分配中: {session} ({gpu})', flush=True)
-    cli('new', '-s', session, '--gpu', gpu)
+    if gpu_norm in ('CPU', 'NONE'):
+        print(f'[mlbridge] Colab 分配中: {session} (CPU 免费模式)', flush=True)
+        cli('new', '-s', session)
+    else:
+        print(f'[mlbridge] Colab 分配中: {session} ({gpu_norm})', flush=True)
+        cli('new', '-s', session, '--gpu', gpu_norm)
     store_local(session, {'project': name, 'job': job, 'session': session,
                           'git_commit': commit, 'inputs': inputs, 'stopped': False})
     try:

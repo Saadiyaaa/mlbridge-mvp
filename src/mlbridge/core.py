@@ -211,6 +211,29 @@ def fetch(name: str, snapshot: str, *, target: Path | None = None,
     return root
 
 
+def check_git_pushed(root: Path) -> None:
+    try:
+        upstream = proc(["git", "rev-parse", "--abbrev-ref", "@{u}"],
+                        cwd=root, capture=True).stdout.strip()
+    except BridgeError:
+        # 无上游跟踪分支（例如纯本地测试仓库或新分支），不阻断
+        return
+
+    if upstream:
+        try:
+            unpushed = proc(["git", "rev-list", f"{upstream}..HEAD"],
+                            cwd=root, capture=True).stdout.strip()
+            if unpushed:
+                count = len(unpushed.splitlines())
+                raise BridgeError(
+                    f"检测到本地有 {count} 个未推送(git push)的代码提交，远端 Colab 将无法拉取；"
+                    "请先执行 git push，或使用 --allow-dirty 忽略"
+                )
+        except BridgeError as exc:
+            if "未推送" in str(exc):
+                raise
+
+
 def git_commit(root: Path, allow_dirty: bool) -> str:
     if not root.is_dir():
         raise BridgeError(f"项目目录不存在: {root}")
@@ -219,6 +242,7 @@ def git_commit(root: Path, allow_dirty: bool) -> str:
                      cwd=root, capture=True).stdout
         if dirty.strip():
             raise BridgeError("项目存在未提交的已跟踪代码改动；先提交推送或使用 --allow-dirty")
+        check_git_pushed(root)
     return proc(["git", "rev-parse", "HEAD"], cwd=root, capture=True).stdout.strip()
 
 

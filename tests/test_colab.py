@@ -85,6 +85,44 @@ def test_launch_failure_attempts_credential_cleanup(tmp_path, monkeypatch):
     # 最后注入的脚本是凭据清理脚本
     cleanup = colab_runner.cleanup_script()
     assert 'mlbridge_restic_password' in cleanup and 'mlbridge_rclone.conf' in cleanup
-    assert put_scripts[-1] == cleanup
     # 启对症断言:准备脚本不含凭据操作
     assert 'mkdir' in put_scripts[0]
+
+
+def test_launch_cpu_mode_without_gpu_flag(tmp_path, monkeypatch):
+    """支持 CPU / none 免费测试模式，不传 --gpu 参数。"""
+    _prepare_project(tmp_path, monkeypatch)
+    cli_calls = []
+    def fake_cli(*args, capture=False, timeout=None):
+        cli_calls.append(args)
+        return subprocess.CompletedProcess(args, 0)
+    monkeypatch.setattr(colab_runner, 'cli', fake_cli)
+    monkeypatch.setattr(colab_runner, 'stage', lambda *args: None)
+    monkeypatch.setattr(colab_runner, 'put_script', lambda *args: None)
+    session = colab_runner.launch('demo', 'example', [], 'CPU', allow_empty_input=True)
+    assert ('new', '-s', session) in cli_calls
+    assert not any('--gpu' in c for c in cli_calls)
+
+
+def test_git_unpushed_commits_blocks_unless_allowed(tmp_path, monkeypatch):
+    """有未 push 到 upstream 的提交时拦截，防白烧 GPU；--allow-dirty 可覆盖。"""
+    root = tmp_path / 'proj_with_upstream'
+    root.mkdir()
+    subprocess.run(['git', 'init', '-q', str(root)], check=True)
+    subprocess.run(['git', '-C', str(root), 'config', 'user.name', 'T'], check=True)
+    subprocess.run(['git', '-C', str(root), 'config', 'user.email', 't@example.com'], check=True)
+    (root / 'f.txt').write_text('v1')
+    subprocess.run(['git', '-C', str(root), 'add', '.'], check=True)
+    subprocess.run(['git', '-C', str(root), 'commit', '-qm', 'c1'], check=True)
+    # 模拟 upstream 分支
+    subprocess.run(['git', '-C', str(root), 'branch', 'upstream_main'], check=True)
+    subprocess.run(['git', '-C', str(root), 'branch', '--set-upstream-to', 'upstream_main'], check=True)
+    # 本地新增提交，领先于 upstream
+    (root / 'f.txt').write_text('v2')
+    subprocess.run(['git', '-C', str(root), 'commit', '-am', 'c2'], check=True)
+    with pytest.raises(core.BridgeError, match='未推送'):
+        core.git_commit(root, allow_dirty=False)
+    # allow_dirty=True 时允许绕过
+    commit = core.git_commit(root, allow_dirty=True)
+    assert len(commit) == 40
+

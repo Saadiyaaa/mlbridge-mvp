@@ -36,7 +36,8 @@ def parser() -> argparse.ArgumentParser:
     x.add_argument('--overwrite', action='store_true', help='显式允许覆盖已有文件')
     x = sub.add_parser('run', help='创建 Colab session，后台运行，默认等待成功并释放资源')
     x.add_argument('project'); x.add_argument('--job', default='example'); x.add_argument('--input', action='append', default=[])
-    x.add_argument('--gpu', default='L4'); x.add_argument('--session')
+    x.add_argument('--gpu', default='L4', help='GPU 类型(T4, L4, A100, H100, G4)或 CPU 免费模式')
+    x.add_argument('--session')
     x.add_argument('--detach', action='store_true', help='不等待；之后用 watch 监视/自动停止')
     x.add_argument('--allow-dirty', action='store_true', help='使用 HEAD，忽略本地未提交代码变更')
     x.add_argument('--allow-empty-input', action='store_true', help='明确确认该任务无需输入快照')
@@ -71,6 +72,13 @@ def execute(args):
             pw = expand(s['password_file'])
             mode = oct(pw.stat().st_mode & 0o777) if pw.is_file() else '-'
             print('restic password file:', 'EXISTS' if pw.is_file() else 'MISSING', mode)
+            if shutil.which('rclone') and expand(s['rclone_config']).is_file():
+                try:
+                    proc(['rclone', 'about', f"{s['remote']}:"],
+                         cwd=Path.home(), env=secret_env(s), capture=True, timeout=5)
+                    print(f'rclone remote ({s["remote"]}): CONNECTED (已验证云端连通性)')
+                except Exception:
+                    print(f'rclone remote ({s["remote"]}): UNVERIFIED (网络未连通或需刷新凭据)')
             try:
                 ok = restic_overwrite_supported()
                 print('restic --overwrite:', 'supported' if ok else 'NOT supported (restic < 0.16.2)')
@@ -105,7 +113,7 @@ def execute(args):
                          allow_dirty=args.allow_dirty, session=args.session,
                          allow_empty_input=args.allow_empty_input)
         print('任务已独立启动，session:', session, flush=True)
-        print(f'调试：colab ssh -s {session}  （不要用 --rm）', flush=True)
+        print(f'调试：colab ssh -s {session} （不要用 --rm）', flush=True)
         if not args.detach:
             print('监视状态直到完成；Ctrl-C 不会故意停止远端训练。', flush=True)
             result = watch(session)

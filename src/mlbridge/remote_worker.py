@@ -71,6 +71,8 @@ def main():
             run(['apt-get', 'install', '-y', '-qq', *missing])
         # GitHub must contain the pinned commit. Private repository auth is not
         # automatically copied from the local machine in this first version.
+        if root.exists():
+            shutil.rmtree(root, ignore_errors=True)
         run(['git', 'clone', '--no-checkout', plan['repository'], str(root)])
         run(['git', 'checkout', plan['commit']], cwd=root)
         status('RESTORING')
@@ -108,6 +110,13 @@ def main():
                 raise RuntimeError('restic produced no final snapshot ID')
         status('SUCCEEDED', elapsed_seconds=elapsed, snapshot_id=result,
                finished=datetime.now(timezone.utc).isoformat())
+        # 在真实 Colab 环境下，如果任务成功发布了产物，尝试调用官方 unassign 自动释放 VM，
+        # 避免用户在 --detach 模式下因本地失联或忘记关机而持续产生扣费账单。
+        try:
+            from google.colab import runtime
+            runtime.unassign()
+        except (ImportError, Exception):
+            pass
     except BaseException as exc:
         status('FAILED', error=f'{type(exc).__name__}: {exc}',
                finished=datetime.now(timezone.utc).isoformat())

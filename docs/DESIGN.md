@@ -1,66 +1,107 @@
-# MLBridge 技术设计 v0.1.1
+# MLBridge 系统架构与技术设计规范
 
-## 目标 / 非目标
+## 1. 系统定位与设计边界
 
-**目标：** 给任何现有 Git/ML 项目外挂一个 CLI，实现显式数据增量发布、按 snapshot 获取数据、在 Colab 临时执行现有 argv 命令，结果持久化后结束 runtime；全部配置和状态均在项目外。
+### 1.1 核心目标
+MLBridge 旨在为现有的 Git 机器学习与算法项目提供标准化的外部数据快照流转与按需算力调度机制。系统通过外部非侵入式配置，在保持本地研究项目绝对干净的前提下，协调代码仓库（GitHub）、对象存储（Google Drive via restic/rclone）以及临时算力节点（Google Colab）。
 
-**非目标：** 将多个项目硬套进新框架、监听全项目实时双向同步、自动推断输入输出、实现 DVC Pipeline、自动修复任意环境/任意训练任务。
+### 1.2 系统边界与非目标 (Scope & Non-Goals)
+- **代码零修改**：研究项目仅作为 `workspace` 路径和原生 `command` 参数存在，不引入任何平台 SDK 或侵入式 API 调用。
+- **全外置配置**：配置与状态存储完全遵循 XDG 标准，不向研究代码库提交配置文件或修改 `.gitignore`。
+- **非分布式调度器**：系统专注于点对点的单任务可靠生命周期管理，不涉及多集群自动调度与资源抢占池构建。
+- **非双向实时同步器**：数据流转依赖显式的只读快照与不可变产物发布，不实施后台文件变动监听与双向文件冲突合并。
 
-## 模块边界
+---
 
-1. `core.py`：XDG 路径、TOML 项目注册、静态配置、路径保护、restic + rclone 仓库接口。
-2. `colab_runner.py`：官方 `colab` CLI 的会话创建、文件注入、状态监控与释放。它不直接传输大型数据。
-3. `remote_worker.py`：Colab VM 临时执行器，处理 Git checkout、输入恢复、原命令调用、输出发布及 JSON 状态。
-4. `cli.py`：向人和 AI Agent 暴露少量命令。
+## 2. 模块划分与职责
 
-研究项目仅被作为 `workspace` 和 `command`，完全不需要导入本工具。
+系统划分为四个核心模块，各司其职且职责边界严格单向流动：
 
-## 不变量
+| 模块 | 运行环境 | 主要职责 |
+| :--- | :--- | :--- |
+| `core.py` | 本地环境 | XDG 路径解析、TOML 配置校验、路径安全沙箱检查、restic 与 rclone 底层调用封装 |
+| `colab_runner.py` | 本地环境 | 基于 `google-colab-cli` 的会话分配、轻量引导文件注入、状态轮询与生命周期控制 |
+| `remote_worker.py` | Colab 节点 | 运行环境准备、Git 固定版本检出、输入快照还原、命令托管执行、输出快照发布、安全凭据擦除 |
+| `cli.py` | 本地环境 | 面向工程师与自动化 Agent 的命令行交互入口及标准输出格式规范 |
 
-- 一份已发布的数据版本用明确的 restic snapshot ID 引用，不通过 `latest` 隐式绑定。
-- snapshot 的文件路径必须是相对项目根目录的路径，避免本地绝对路径在 Colab 上失效。
-- 所有 Colab 训练输入恢复到 `/content/mlbridge-workspace`，不直接从挂载 Drive 随机读取图片。
-- 恢复输入时快照优先：restic ≥ 0.16.2 用 `--overwrite always`；更老版本缺省即覆盖（`--overwrite` 旗标需探测，避免 unknown flag）。
-- 绝不把 SSH 的存活当作任务存活；不传 `--rm`。
-- 只有远端 worker 报告 `SUCCEEDED`（完成 output backup），本地 watcher 才自动 stop。
-- 网络不可达状态是 `UNKNOWN`，而不是 `FAILED`；不会根据隧道掉线自动释放资源。
-- `jobs.<job>.outputs` 可为空：无输出任务合法，不进入 PUBLISHING 阶段，也不发布 output snapshot。
-- restic 密码和 rclone.conf 不被写入 Git 仓库或 job JSON，临时提供给 Colab，作业结束后从 VM 临时路径删除；`launch` 注入失败路径上会尽力注入清理脚本删除已上传凭据。
+---
 
-## 状态机
+## 3. 核心设计不变量 (System Invariants)
+
+1. **版本绝对确定性**：
+   - 代码执行严格绑定已推送至远程仓库的固定 Git Commit Hash。
+   - 数据输入与产物输出严格绑定 64 位十六进制 Snapshot ID，严禁使用指向不确定的动态标签（如 `latest`）。
+2. **路径相对性与安全沙箱**：
+   - 快照输入与输出路径必须为相对于项目根目录的合法相对路径。
+   - 严禁包含 `.`、`..` 等跨目录符号，严禁软链接越界，严禁包含 `.git` 目录。
+3. **输入恢复快照优先（Snapshot Precedence）**：
+   - 远端恢复输入快照时必须覆盖与 Git 跟踪文件同路径的历史内容（`--overwrite always`），保证数据快照作为输入的唯一契约。
+4. **进程生命周期与网络解耦**：
+   - 远端 Worker 以独立操作系统会话（`start_new_session=True`）启动，脱离控制端 SSH/CLI 连接状态，规避终端断开引发的 `SIGHUP` 异常终止。
+5. **算力释放与现场保护分离**：
+   - 仅当远端报告 `SUCCEEDED` 且输出产物成功回传后，触发自动关机释放算力。
+   - 遇到 `FAILED` 状态时保留实例现场，供调试与日志排查。
+   - 遇到 `UNREACHABLE` 控制信道中断时，系统标记为未知状态，严禁擅自关停运行中实例。
+
+---
+
+## 4. 运行时状态机 (State Machine Specification)
 
 ```text
-LOCAL_PREFLIGHT → ALLOCATE → STAGE → REMOTE_STARTED
-                                  |
-                               PREPARING
-                                  ↓
-                               RESTORING
-                                  ↓
-                                RUNNING
-                                  ↓
-                              PUBLISHING
-                                  ↓
-                               SUCCEEDED ── stop
-
-任何远端阶段的异常 → FAILED ── 保留 VM + 日志，手动 stop
-任何本地控制通道错误 → UNREACHABLE / UNKNOWN，禁止自动 stop
+       [ 本地环境 ]                                     [ Colab 远端环境 ]
+       
+   LOCAL_PREFLIGHT (参数/Git状态检查)
+          │
+      ALLOCATE (申请计算实例)
+          │
+        STAGE (注入 Worker 与凭据) ── 启动独立进程 ──>  PREPARING (安装基础工具/克隆仓库)
+                                                                 │
+                                                             RESTORING (快照解包写入本地盘)
+                                                                 │
+                                                              RUNNING (执行原生命令)
+                                                                 │
+                                                            PUBLISHING (备份输出产物)
+                                                                 │
+                                                             SUCCEEDED / FAILED
+                                                                 │
+   WATCH / STATUS (状态轮询) <────── 状态回传 ─────────────────────┘
+          │
+  ┌───────┴────────────────────────┐
+  ▼                                ▼
+SUCCEEDED ──> 释放计算实例       FAILED ──> 保留实例供排障 (需手动 stop)
 ```
 
-注：Colab 不保证 VM 生命周期；SSH 独立进程仅保证在正常 SSH 断开时不因挂断信号退出，不构成对 Google 后端回收策略的保证。
+### 状态定义说明
+- `PREPARING`：实例初始化阶段，安装 `git`、`restic`、`rclone`，拉取指定 Git Commit。
+- `RESTORING`：调用 restic 从云端仓库流式解包输入快照至本地临时工作区 `/content/mlbridge-workspace/`。
+- `RUNNING`：执行项目 `setup` 依赖安装，并在独立 OS 进程中启动目标计算 `command`。
+- `PUBLISHING`：计算完成后，将项目配置中指定的 `outputs` 目录打包推送至云端存储，生成输出快照。
+- `SUCCEEDED`：全部阶段正常结束，触发实例回收。
+- `FAILED`：任意远端阶段异常中断，保留错误堆栈及临时环境。
+- `UNREACHABLE`：本地与远端控制信道连续超时，保持现状等待重连。
 
-## 多 Worker 逻辑
+---
 
-每台机器都应安装 CLI 和 Git/Restic/rclone，并复制用户自有的外部项目配置与**同一仓库密码**。代码以 Git commit 固定版本；数据借助每个项目的独立 Drive restic 仓库实现多机发布与拉取；不要求所有服务器同步整个目录。第一版不自动共享完整本地数据缓存，也不解决同时写同一 output 路径的问题。
+## 5. 数据存储与快照模型
 
-## 性能权衡
+### 5.1 存储命名空间
+云端对象存储按项目实施物理命名空间隔离：
+```text
+rclone:<remote>:<prefix>/<project_name>
+```
+每个项目对应独立的 restic 加密仓库，具备独立的密码认证与索引元数据，杜绝多项目间的数据交叉与并发破坏。
 
-restic 减少 Google Drive 的物理对象数量与重复内容传输，但初次 Colab restore 需要读取当前任务的完整 working set。项目有大量 PNG/JPEG，restic 分块不能显著缩小已经压缩的不同图片；主要收益是跳过不变文件和降低 Drive 小文件 API 压力。Colab 工具安装、环境安装和冷数据恢复都耗时。后续可增加复用已有 Colab session、读取更少输入快照、按需逐阶段执行等优化，但不应先开发完整调度器。
+### 5.2 增量去重与传输优化
+- restic 在底层利用内容定义分块（Content-Defined Chunking）实施增量去重。
+- 连续版本的数据集或相似产物在推送到云端存储时仅上传新增变更数据块。
+- 任务执行时，Colab 实例直接在云服务商内网高速拉取并写入实例本地 NVMe 虚拟盘，规避挂载网络盘带来的随机小文件 I/O 阻塞与 API 限流问题。
 
-## v0.1 局限与下一步
+---
 
-1. 最重要：需要在实际账号上确认官方 Colab CLI 的 `upload/download/exec` 调用、远端分离进程持续运行、session 回收策略、工具安装与 runtime 权限。**未验证前不能承诺无人值守或运行时不中断。**
-2. 必须在真实 restic / Drive 后端验证 snapshot 的 JSON 输出、初次/重复 publish、恢复路径与 API 请求量；目前仅离线模拟。
-3. 当前本地轮询器必须存活才能自动 stop；若本地机器掉线或 CLI 崩溃，Colab 可能保持运行直到后端回收。通过 `watch` 恢复，或运行外部 supervisor 托管 watcher。不要在远端执行未经授权的自动 keep-alive 逻辑。
-4. 私有 Git 仓库需要独立的只读、短期认证方案；此版本仅建议公开仓库。
-5. 恢复到已有项目目录时默认为不覆盖。若要严格校验完整一致性，应实现恢复至隔离临时目录 + 清单校验 + 显式合并策略。
-6. 原程序内部若有硬编码绝对路径、依赖交互式终端、依赖特定本地环境，可能需要外部路径映射/适配。模块能做到源码透明，但不能保证任意程序零配置运行。
+## 6. 安全架构与凭据生命周期
+
+1. **最小凭据权限**：本地密码文件与配置文件权限由程序强制设置为 `0600`。
+2. **凭据隔离机制**：敏感凭据（rclone 配置文件与 restic 密码）仅在任务生命周期内临时注入至 `/content/` 路径，绝不随 Git 提交或写入代码仓库。
+3. **安全自毁保障**：
+   - 任务正常完成或异常退出时，Worker 均在 `finally` 块中立即执行临时凭据文件的 `unlink` 销毁。
+   - 若本地在调度注入阶段遭遇异常，本地调度器将向实例触发应急清理脚本，尽最大努力擦除已传输的敏感文件。

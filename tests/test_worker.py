@@ -110,3 +110,50 @@ def test_worker_legacy_restic_without_overwrite_flag(tmp_path, monkeypatch):
     assert (result['ws'] / 'outputs' / 'img.png').read_bytes() == b'SNAPSHOT'
     assert result['restore_log']
     assert all('--overwrite' not in line for line in result['restore_log'])
+
+
+def test_worker_cleans_dirty_workspace_before_clone(tmp_path, monkeypatch):
+    """如果之前任务留下了未清空的 workspace 目录，重新运行时自动安全重建，不报 git clone 冲突。"""
+    repo = tmp_path / 'existing-git-project'
+    repo.mkdir()
+    subprocess.run(['git', 'init', '-q', str(repo)], check=True)
+    subprocess.run(['git', 'config', 'user.name', 'Test'], cwd=repo, check=True)
+    subprocess.run(['git', 'config', 'user.email', 'test@example.com'], cwd=repo, check=True)
+    (repo / 'run.py').write_text(
+        "from pathlib import Path\np=Path('outputs')\np.mkdir(exist_ok=True)\n"
+        "(p/'img.png').write_bytes(b'OK')\n")
+    subprocess.run(['git', 'add', '.'], cwd=repo, check=True)
+    subprocess.run(['git', 'commit', '-qm', 'initial'], cwd=repo, check=True)
+    commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=repo, text=True).strip()
+    base = tmp_path / 'remote-root'
+    base.mkdir()
+    # 模拟遗留的脏目录
+    dirty_ws = base / 'mlbridge-workspace'
+    dirty_ws.mkdir()
+    (dirty_ws / 'dirty_file.txt').write_text('stale residue')
+    (base / 'mlbridge_rclone.conf').write_text('[gdrive]\ntype=drive\n')
+    (base / 'mlbridge_restic_password').write_text('test')
+    plan = {'job_id': 'test2', 'session': 'test2', 'project': 'demo',
+            'repository': str(repo), 'commit': commit, 'restic_repository': 'rclone:gdrive:store/demo',
+            'inputs': ['0'*64], 'setup': [], 'command': [sys.executable, 'run.py'],
+            'outputs': ['outputs']}
+    (base / 'mlbridge_job.json').write_text(json.dumps(plan))
+    fakebin = tmp_path / 'fakebin'
+    fakebin.mkdir()
+    restic_log = tmp_path / 'restic.log'
+    restic_log.write_text('')
+    (fakebin / 'restic').write_text(FAKE_RESTIC)
+    (fakebin / 'restic').chmod(0o755)
+    (fakebin / 'rclone').write_text('#!/bin/sh\nexit 0\n')
+    (fakebin / 'rclone').chmod(0o755)
+    monkeypatch.setenv('PATH', str(fakebin) + os.pathsep + os.environ['PATH'])
+    monkeypatch.setenv('FAKE_RESTIC_VERSION', '0.17.0')
+    monkeypatch.setenv('FAKE_RESTIC_LOG', str(restic_log))
+    monkeypatch.setattr(remote_worker, 'BASE', base)
+    monkeypatch.setattr(remote_worker, 'STATE', base / 'mlbridge_state.json')
+    monkeypatch.setattr(remote_worker, 'PLAN', base / 'mlbridge_job.json')
+    remote_worker.main()
+    state = json.loads((base / 'mlbridge_state.json').read_text())
+    assert state['phase'] == 'SUCCEEDED'
+    assert not (dirty_ws / 'dirty_file.txt').exists()
+
