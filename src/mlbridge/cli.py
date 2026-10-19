@@ -45,7 +45,8 @@ def parser() -> argparse.ArgumentParser:
     x.add_argument('--session')
     x.add_argument('--max-active-sessions', type=int, default=None,
                    help='单实例守卫：分配前用 `colab sessions` 核对活跃实例数，超过则拒绝（不做任何清理）。'
-                        '默认读 settings.toml [colab].max_active_sessions（缺省 1）；0 关闭检查')
+                        '默认读 settings.toml [colab].max_active_sessions（缺省 1）；0 只关闭并发上限检查，'
+                        '复用已在 colab 活跃的 --session 名仍会被 fail-closed 拒绝')
     x.add_argument('--detach', action='store_true', help='不等待；之后用 watch 监视/自动停止')
     x.add_argument('--allow-dirty', action='store_true', help='使用 HEAD，忽略本地未提交代码变更')
     x.add_argument('--allow-empty-input', action='store_true', help='明确确认该任务无需输入快照')

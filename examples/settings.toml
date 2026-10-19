@@ -9,5 +9,6 @@ rclone_config = "/home/user/.config/rclone/rclone.conf"
 default_gpu = "L4"
 high_mem = false
 # 单实例分配守卫：run 在 colab new 前用 `colab sessions` 核对活跃实例数，
-# 超过上限即拒绝（不重试、不停止任何实例）。0 = 关闭检查。
+# 超过上限即拒绝（不重试、不停止任何实例）。0 = 只关闭并发上限检查；
+# 复用已在 colab 活跃的 --session 名仍会被 fail-closed 拒绝。
 max_active_sessions = 1

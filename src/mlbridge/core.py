@@ -100,7 +100,9 @@ def default_high_mem() -> bool:
 def default_max_active_sessions() -> int:
     """单实例守卫的默认上限；旧配置缺省为 1（保守策略）。
 
-    0 表示显式关闭该检查（例如多实例由用户自行管理）。负数与非法
+    0 表示显式关闭并发上限检查（例如多实例由用户自行管理）；即使为 0，
+    复用已在 colab 活跃的 --session 名仍会被 fail-closed 拒绝（安全底线，
+    见 colab_runner.check_single_active）。负数与非法
     类型一律拒绝，绝不静默放宽。
     """
     value = _colab_settings().get("max_active_sessions", 1)

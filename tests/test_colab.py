@@ -515,10 +515,16 @@ def test_check_single_active_empty_other_and_own():
     # 已有 1 个他人实例：达到上限，拒绝
     with pytest.raises(core.BridgeError, match='单实例策略拒绝分配'):
         colab_runner.check_single_active('new', 1, ['existing'])
-    # 复用自己的 session 名不构成“他人实例”：不阻碍对既有实例的操作
-    assert colab_runner.check_single_active('existing', 1, ['existing']) == []
-    # limit=2 时 1 个他人实例放行
+    # 复用已在服务器上活跃的 session 名一律 fail-closed 拒绝（安全底线），
+    # 即使 limit 显式为 0 也不例外：这是分配失败竟底 stop 不误杀生产实例
+    # 的前提。
+    with pytest.raises(core.BridgeError, match='已在 colab 服务器上活跃'):
+        colab_runner.check_single_active('existing', 1, ['existing'])
+    with pytest.raises(core.BridgeError, match='已在 colab 服务器上活跃'):
+        colab_runner.check_single_active('existing', 0, ['existing'])
+    # limit=2 时 1 个他人实例放行；limit=0 只关闭上限计数（own 未活跃时）
     assert colab_runner.check_single_active('new', 2, ['existing']) == ['existing']
+    assert colab_runner.check_single_active('new', 0, ['busy']) == []
 
 
 def test_check_single_active_never_stops_or_kills(monkeypatch):
@@ -528,6 +534,8 @@ def test_check_single_active_never_stops_or_kills(monkeypatch):
     monkeypatch.setattr(colab_runner, 'shutdown', deny_shutdown)
     with pytest.raises(core.BridgeError):
         colab_runner.check_single_active('new', 1, ['busy'])
+    with pytest.raises(core.BridgeError):
+        colab_runner.check_single_active('own', 1, ['own'])
 
 
 def test_launch_guard_refuses_before_new_and_without_local_record(tmp_path, monkeypatch):
@@ -585,22 +593,37 @@ def test_launch_queries_sessions_before_new(tmp_path, monkeypatch):
     assert colab_runner.get_local(session)['stopped'] is False
 
 
-def test_launch_max_active_sessions_zero_disables_guard(tmp_path, monkeypatch):
-    """--max-active-sessions 0 ⇒ 显式关闭检查，完全不查询 sessions。"""
+def test_launch_max_active_sessions_zero_skips_limit_count(tmp_path, monkeypatch):
+    """--max-active-sessions 0 ⇒ 关闭并发上限计数：多个他人实例也放行。"""
     _prepare_project(tmp_path, monkeypatch)
-    calls = []
-
-    def fake_cli(*args, capture=False, timeout=None):
-        calls.append(args)
-        if args[0] == 'sessions':
-            raise AssertionError('limit=0 must not query sessions')
-        return subprocess.CompletedProcess(args, 0)
-    monkeypatch.setattr(colab_runner, 'cli', fake_cli)
+    monkeypatch.setattr(colab_runner, 'list_active_sessions',
+                        lambda: ['other-1', 'other-2'])
+    monkeypatch.setattr(colab_runner, 'cli',
+                        lambda *a, **k: subprocess.CompletedProcess(a, 0))
     monkeypatch.setattr(colab_runner, 'stage', lambda *a: None)
     monkeypatch.setattr(colab_runner, 'put_script', lambda *a: None)
-    colab_runner.launch('demo', 'example', [], 'L4', allow_empty_input=True,
-                        max_active_sessions=0)
-    assert any(c[0] == 'new' for c in calls)
+    session = colab_runner.launch('demo', 'example', [], 'L4',
+                                  allow_empty_input=True, max_active_sessions=0)
+    assert colab_runner.get_local(session)['stopped'] is False
+
+
+def test_launch_disabled_limit_still_refuses_own_active_session(tmp_path, monkeypatch):
+    """limit=0 时复用活跃 --session 仍 fail-closed：不 new、不 stop、
+    不写本地记录；分配失败竟底 stop 绝不可能命中预先存在的实例。"""
+    _prepare_project(tmp_path, monkeypatch)
+    calls = []
+    monkeypatch.setattr(colab_runner, 'list_active_sessions', lambda: ['mlb-own-0001'])
+    monkeypatch.setattr(colab_runner, 'cli',
+                        lambda *a, **k: calls.append(a) or subprocess.CompletedProcess(a, 0))
+    monkeypatch.setattr(colab_runner, 'shutdown',
+                        lambda s: (_ for _ in ()).throw(
+                            AssertionError('must not stop on guard refusal')))
+    with pytest.raises(core.BridgeError, match='已在 colab 服务器上活跃'):
+        colab_runner.launch('demo', 'example', [], 'L4', session='mlb-own-0001',
+                            allow_empty_input=True, max_active_sessions=0)
+    assert not any(c[0] == 'new' for c in calls)
+    assert not any(c[0] == 'stop' for c in calls)
+    assert not list((core.state_dir() / 'jobs').glob('*.json'))
 
 
 def test_launch_negative_limit_rejected(tmp_path, monkeypatch):
@@ -625,9 +648,6 @@ def test_launch_configured_limit_from_settings(tmp_path, monkeypatch):
     # 1 个他人实例 < limit 2 ⇒ 放行
     session = colab_runner.launch('demo', 'example', [], allow_empty_input=True)
     assert colab_runner.get_local(session)['stopped'] is False
-    # 同样的活跃列表 + limit 1 ⇒ 拒绝
-    with (core.config_dir() / 'settings.toml').open('a') as f:
-        f.write('\nmax_active_sessions=1\n')  # 顶层重复键？不行——改用独立测试
 
 
 def test_launch_configured_limit_one_refuses(tmp_path, monkeypatch):
@@ -678,3 +698,89 @@ def test_watch_records_last_known_and_terminal_diagnostic(tmp_path, monkeypatch)
 def test_record_observation_ignores_missing_record():
     """没有本地记录时（如手工观察未知 session）静默跳过，绝不上抛。"""
     colab_runner.record_observation('ghost', {'phase': 'RUNNING'})  # 不应抛错
+
+
+def test_record_observation_keeps_last_confirmed_phase_over_unreachable(tmp_path):
+    """UNREACHABLE 绝不覆盖最后一次确认的真实远端阶段。
+
+    watch 反复遇网/超时会把 last_known RUNNING 刷成 UNREACHABLE，丢失
+    “消失前在干什么”的全部信息；正确行为是跳过而不是写入。
+    """
+    colab_runner.store_local('job', {'stopped': False})
+    # 首次是真观测：RUNNING 被记录
+    colab_runner.record_observation('job', {'phase': 'RUNNING'})
+    first = colab_runner.get_local('job')['last_known']
+    assert first['phase'] == 'RUNNING'
+    # 连续多次 UNREACHABLE：last_known 保持 RUNNING，观测时间戳不变
+    for _ in range(6):
+        colab_runner.record_observation('job', {'phase': 'UNREACHABLE',
+                                                'reason': 'connection lost'})
+    last = colab_runner.get_local('job')['last_known']
+    assert last['phase'] == 'RUNNING'
+    assert last['observed'] == first['observed']
+    # 再次确认到真实阶段后正常覆盖
+    colab_runner.record_observation('job', {'phase': 'RESTORING'})
+    assert colab_runner.get_local('job')['last_known']['phase'] == 'RESTORING'
+
+
+def test_record_observation_writes_unreachable_without_prior_phase():
+    """没有已确认阶段时，UNREACHABLE 可以落盘（此时没有可保留的东西）。"""
+    colab_runner.store_local('fresh', {'stopped': False})
+    colab_runner.record_observation('fresh', {'phase': 'UNREACHABLE'})
+    assert colab_runner.get_local('fresh')['last_known']['phase'] == 'UNREACHABLE'
+
+
+def test_watch_preserves_running_last_known_through_unreachable_spell(monkeypatch):
+    """RUNNING 后连续 6 次 UNREACHABLE ⇒ 返回 UNKNOWN，但 last_known
+    仍是最后确认的 RUNNING，而不是被刷成 UNREACHABLE。"""
+    colab_runner.store_local('job', {'stopped': False})
+    phases = iter(['RUNNING'] + ['UNREACHABLE'] * 6)
+    monkeypatch.setattr(colab_runner, 'get_status',
+                        lambda s: {'phase': next(phases)})
+    monkeypatch.setattr(colab_runner.time, 'sleep', lambda s: None)
+    monkeypatch.setattr(colab_runner, 'shutdown',
+                        lambda s: (_ for _ in ()).throw(
+                            AssertionError('must not stop on unknown status')))
+    result = colab_runner.watch('job', interval=5)
+    assert result['phase'] == 'UNKNOWN'
+    record = colab_runner.get_local('job')
+    assert record['last_known']['phase'] == 'RUNNING'
+
+
+def test_concurrent_stop_and_watch_record_merge(monkeypatch):
+    """并发 stop/watch 状态写入：per-job flock 使读改写合并，字段不丢。
+
+    多线程反复并发执行 record_observation（watch 的写路径）与 shutdown
+    （stop 的写路径）。关键是最终状态必须同时包含两边写入的字段；
+    若写路径不加锁，record_observation 的整份覆写会丢掉并发写入的
+    stopped（或反之）。锁文件落在 jobs/<session>.lock。
+    """
+    colab_runner.store_local('job', {'stopped': False})
+    monkeypatch.setattr(colab_runner, 'cli',
+                        lambda *a, **k: subprocess.CompletedProcess(a, 0))
+
+    import threading
+    errors: list[Exception] = []
+
+    def watcher():
+        try:
+            for i in range(24):
+                colab_runner.record_observation('job', {'phase': 'RUNNING'})
+                if i % 4 == 0:
+                    colab_runner.shutdown('job')  # 与其他线程的 stop 并发
+        except Exception as exc:  # pragma: no cover - 仅在出现真正错误时触发
+            errors.append(exc)
+
+    threads = [threading.Thread(target=watcher) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+    assert errors == []
+    record = colab_runner.get_local('job')
+    # 两路写入都被保留（merge 而非丢字段覆盖）
+    assert record['stopped'] is True
+    assert record['last_known']['phase'] == 'RUNNING'
+    assert 'observed' in record['last_known']
+    # per-job 锁文件存在
+    assert colab_runner.state_path('job').with_suffix('.lock').is_file()

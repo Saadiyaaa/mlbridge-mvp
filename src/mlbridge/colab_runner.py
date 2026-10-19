@@ -74,10 +74,25 @@ def state_path(session: str) -> Path:
 
 
 def store_local(session: str, manifest: dict):
+    # 原子替换写入：并发读者（status / watch / stop）永远只会看到完整旧
+    # 版本或完整新版本，不会读到半份 JSON；配合 per-job flock 的读改写
+    # 合并，rmw + 原子落盘一起保证跨进程不丢失字段。
     path = state_path(session)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2))
-    path.chmod(0o600)
+    tmp = path.with_name(f'{path.name}.tmp-{os.getpid()}-{secrets.token_hex(4)}')
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            f.write(json.dumps(manifest, ensure_ascii=False, indent=2))
+            f.flush()
+            os.fsync(f.fileno())
+        tmp.chmod(0o600)
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 
 def get_local(session: str) -> dict:
@@ -140,15 +155,26 @@ def list_active_sessions() -> list[str]:
 
 
 def check_single_active(own: str, limit: int, active: list[str] | None = None) -> list[str]:
-    """单实例分配守卫：超过上限时抛错拒绝，不做任何清理动作。
+    """单实例分配守卫（fail-closed）：不做任何清理动作，只抛错拒绝。
 
-    own（本次要分配的 session）不算他人实例；这样 --session 复用既有
-    名字时不会阻碍对已有实例的后续操作。limit<=0 直接放行。
+    两道检查，均在 `colab new` 之前执行：
+    1. own 已活跃 ⇒ 复用活跃 session 一律拒绝。这是安全底线，即使
+       limit=0（显式关闭并发上限检查）也必须执行：否则 --session 复用
+       一个正在生产的实例后，`colab new` 失败路径上的兜底 stop 会有
+       误杀真实任务的风险。拒绝优先于一切（包括不写本地记录）。
+    2. limit>0 时按他人（own 以外）实例数核对上限。
     """
+    fetched = list_active_sessions() if active is None else active
+    if own in fetched:
+        raise BridgeError(
+            f'拒绝分配：session {own} 已在 colab 服务器上活跃。'
+            '复用活跃 session 会覆盖本地任务记录，且分配失败时的兜底停止可能'
+            '误杀正在生产的实例。请先用 `mlbridge status`/`watch` 观察，'
+            '确认任务已结束且实例可释放后手动执行 `mlbridge stop`，'
+            '或改用新的 --session 名。不要盲目重试本命令。')
     if limit <= 0:
         return []
-    others = [s for s in (list_active_sessions() if active is None else active)
-              if s != own]
+    others = [s for s in fetched if s != own]
     if len(others) >= limit:
         raise BridgeError(
             f'单实例策略拒绝分配（max_active_sessions={limit}）：'
@@ -156,6 +182,28 @@ def check_single_active(own: str, limit: int, active: list[str] | None = None) -
             f'确认这些实例是否还在使用；确认后用 `mlbridge stop <session>` 手动释放，'
             f'再重新提交。不要盲目重试本命令；本工具不会代替你停止任何实例。')
     return others
+
+
+@contextlib.contextmanager
+def _job_lock(session: str):
+    """单任务跨进程互斥：保护 state/jobs/<session>.json 的读改写合并。
+
+    watch（record_observation / 终态写入）与 stop（shutdown 的 stopped
+    标记）仍是逐份读-改-写，若不加锁会互相覆盖（丢字段）。锁粒度是
+    单个 job 文件；获取顺序恒为 launch.lock → job lock（launch 持有
+    launch.lock 期间的兜底 stop 会短暂持有 job lock），watch/stop 从不
+    反向获取 launch.lock，因此不存在死锁环路。锁只在合并窗口内持有，
+    不跨任何有界网络调用。
+    """
+    path = state_path(session).with_suffix('.lock')
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_WRONLY, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 @contextlib.contextmanager
@@ -193,14 +241,27 @@ def record_observation(session: str, status: dict) -> None:
     VM 消失后 /content 不可恢复；本地 last-known 至少保留最后一次看到的
     阶段/时间戳，供 status/watch 判断“消失前在干什么”。绝不把它当作
     远端当前状态。
+
+    瞬时 UNREACHABLE（网络抖动、CLI 超时）绝不覆盖 last_known：否则
+    反复观测失败会把最后确认的真实 RUNNING 阶段抹掉，丢失“消失前在
+    干什么”的全部信息。已有已确认阶段时直接跳过本次落盘。
     """
     try:
-        record = get_local(session)
-        record['last_known'] = {
-            **status,
-            'observed': datetime.now(timezone.utc).isoformat(),
-        }
-        store_local(session, record)
+        previous = get_local(session).get('last_known')
+    except BridgeError:
+        return
+    if (status.get('phase') == 'UNREACHABLE' and isinstance(previous, dict)
+            and previous.get('phase')):
+        # 保留最后一次确认的远端阶段；观测时间戳不变（本次并未真正观测到）。
+        return
+    try:
+        with _job_lock(session):
+            record = get_local(session)
+            record['last_known'] = {
+                **status,
+                'observed': datetime.now(timezone.utc).isoformat(),
+            }
+            store_local(session, record)
     except BridgeError:
         pass
 
@@ -236,12 +297,14 @@ def save_terminal_diagnostic(session: str, status: dict) -> bool:
 
 def shutdown(session: str) -> None:
     # stop 幂等（对已停止 session colab 退出码为 0）；有界重试以穿透瞬时
-    # 控制面抖动。只有 cli 成功返回后才标记本地 stopped:true。
+    # 控制面抖动。只有 cli 成功返回后才标记本地 stopped:true。stopped 标记
+    # 的读改写在 job 锁内完成，不会覆盖并发 watch 正在写入的其他字段。
     cli_retry('stop', '-s', session, timeout=STOP_TIMEOUT)
     try:
-        record = get_local(session)
-        record['stopped'] = True
-        store_local(session, record)
+        with _job_lock(session):
+            record = get_local(session)
+            record['stopped'] = True
+            store_local(session, record)
     except BridgeError:
         pass
 
@@ -424,18 +487,20 @@ def _staging_failed(session: str, starter_sent: bool) -> None:
     手动停止提示，由用户确认后自行处理。
     """
     try:
-        record = get_local(session)
-        record['staging_failed'] = True
-        store_local(session, record)
+        with _job_lock(session):
+            record = get_local(session)
+            record['staging_failed'] = True
+            store_local(session, record)
     except BridgeError:
         pass
     if starter_sent:
         status = get_status(session)
         phase = status.get('phase', 'UNKNOWN')
         try:
-            record = get_local(session)
-            record['staging_probe_phase'] = phase
-            store_local(session, record)
+            with _job_lock(session):
+                record = get_local(session)
+                record['staging_probe_phase'] = phase
+                store_local(session, record)
         except BridgeError:
             pass
         if phase in WORKER_PHASES:
@@ -509,15 +574,17 @@ def launch(name: str, job: str, inputs: list[str], gpu: str | None = None,
     if use_high_mem:
         request.append('--high-mem')
     # 先写本地记录再分配：即使 new 本身挂死/失败，也存在可 stop/审计的记录。
-    # 单实例守卫在 `colab new` 之前执行；guard 失败 ⇒ 不写本地记录、不分配、
-    # 不 stop 任何实例。检查与分配在跨进程 flock 内串行，收敛同机并发窗口。
+    # 守卫在 `colab new` 之前执行，且无论 limit 是否为 0 都会查询一次活跃
+    # 列表：只有证明 own 当前不在活跃列表里，后续分配失败时才敢安全清理，
+    # 复用活跃 session 一律 fail-closed 拒绝（不分配、不记录、不清
+    # 理、不 stop 任何实例）。检查与分配在跨进程 flock 内串行，收敛同机
+    # 并发窗口。
     limit = (default_max_active_sessions() if max_active_sessions is None
              else max_active_sessions)
     if max_active_sessions is not None and max_active_sessions < 0:
-        raise BridgeError('--max-active-sessions 必须是非负整数（0=关闭检查）')
+        raise BridgeError('--max-active-sessions 必须是非负整数（0=关闭并发上限检查）')
     with _launch_lock():
-        if limit > 0:
-            check_single_active(session, limit)
+        check_single_active(session, limit)
         store_local(session, {'project': name, 'job': job, 'session': session,
                               'git_commit': commit, 'inputs': inputs, 'stopped': False})
         try:
@@ -525,6 +592,9 @@ def launch(name: str, job: str, inputs: list[str], gpu: str | None = None,
         except BridgeError:
             # 分配失败绝不重试 new（避免复制计费实例）；若实例实际已创建，
             # stop 是幂等的，最坏情况只是对不存在的 session 空跑一次。
+            # 能走到这里的只会是“守卫时已确认未活跃”的全新 session：
+            # 复用活跃实例的请求在上面已被拒绝，兜底 stop 永远不可能
+            # 命中预先存在的生产实例。
             try:
                 shutdown(session)
             except BridgeError:
@@ -598,9 +668,10 @@ def watch(session: str, *, interval: int = 20, auto_stop: bool = True) -> dict:
         print(f'[mlbridge] {session}: {phase}', flush=True)
         if phase in FINAL:
             try:
-                record = get_local(session)
-                record['result'] = status
-                store_local(session, record)
+                with _job_lock(session):
+                    record = get_local(session)
+                    record['result'] = status
+                    store_local(session, record)
             except BridgeError:
                 pass
             save_terminal_diagnostic(session, status)
