@@ -1,9 +1,14 @@
+import json
 import subprocess
 from pathlib import Path
 
 import pytest
 
 from mlbridge import colab_runner, core
+
+# autouse fixture 会把 list_active_sessions 打桩为空；需要真实实现（打桩
+# 底层 cli）的解析测试从这里取回原函数。
+_REAL_LIST_ACTIVE = colab_runner.list_active_sessions
 
 
 @pytest.fixture(autouse=True)
@@ -13,6 +18,8 @@ def isolated_state(tmp_path, monkeypatch):
     monkeypatch.delenv('MLBRIDGE_GITHUB_TOKEN', raising=False)
     monkeypatch.setattr(colab_runner, '_github_secrets_path',
                         lambda: tmp_path / 'isolated-secrets.env')
+    # 单实例守卫默认打桩为空，已有测试不触网；守卫本体由专属测试覆盖。
+    monkeypatch.setattr(colab_runner, 'list_active_sessions', lambda: [])
 
 
 def test_job_spec_requires_argv_and_valid_outputs():
@@ -458,3 +465,216 @@ def test_exec_starter_once_never_retries(monkeypatch):
     assert calls[0][0][:3] == ('exec', '-s', 'sess')
     assert calls[0][1] == colab_runner.EXEC_TIMEOUT
     assert sleeps == []  # 无退避 ⇒ 无重试
+
+
+# ---------------------------------------------------------------------------
+# 单实例分配守卫（fail-closed）：默认 max_active_sessions=1
+# ---------------------------------------------------------------------------
+
+def test_list_active_sessions_parses_empty_and_active_lines(monkeypatch):
+    monkeypatch.setattr(colab_runner, 'list_active_sessions', _REAL_LIST_ACTIVE)
+    def fake_cli(*args, capture=False, timeout=None):
+        assert args == ('sessions',) and capture is True
+        assert timeout == colab_runner.SESSIONS_TIMEOUT
+        return subprocess.CompletedProcess(args, 0, stdout='[colab] No active sessions found on server.\n')
+    monkeypatch.setattr(colab_runner, 'cli', fake_cli)
+    assert colab_runner.list_active_sessions() == []
+
+    def fake_cli_active(*args, capture=False, timeout=None):
+        return subprocess.CompletedProcess(args, 0, stdout=(
+            '[mlb-demo-ab12cd34] endpoint-1 | Hardware: A100 | Shape: ... | Variant: GPU\n'
+            '[other] endpoint-2 | Hardware: T4 | Shape: ... | Variant: DEFAULT\n'))
+    monkeypatch.setattr(colab_runner, 'cli', fake_cli_active)
+    assert colab_runner.list_active_sessions() == ['mlb-demo-ab12cd34', 'other']
+
+
+def test_list_active_sessions_fails_closed_on_cli_error_and_garbage(monkeypatch):
+    """CLI 失败/超时/格式未知 ⇒ 一律视为拒绝分配，绝不当作空。"""
+    monkeypatch.setattr(colab_runner, 'list_active_sessions', _REAL_LIST_ACTIVE)
+    def boom(*args, **kwargs):
+        raise core.BridgeError('命令超时: colab')
+    monkeypatch.setattr(colab_runner, 'cli', boom)
+    with pytest.raises(core.BridgeError, match='超时'):
+        colab_runner.list_active_sessions()
+
+    def garbage(*args, capture=False, timeout=None):
+        return subprocess.CompletedProcess(args, 0, stdout='??????\n')
+    monkeypatch.setattr(colab_runner, 'cli', garbage)
+    with pytest.raises(core.BridgeError, match='无法解析'):
+        colab_runner.list_active_sessions()
+
+    def empty_but_weird(*args, capture=False, timeout=None):
+        return subprocess.CompletedProcess(args, 0, stdout='')
+    monkeypatch.setattr(colab_runner, 'cli', empty_but_weird)
+    with pytest.raises(core.BridgeError, match='按未知处理'):
+        colab_runner.list_active_sessions()
+
+
+def test_check_single_active_empty_other_and_own():
+    assert colab_runner.check_single_active('s1', 1, []) == []
+    # 已有 1 个他人实例：达到上限，拒绝
+    with pytest.raises(core.BridgeError, match='单实例策略拒绝分配'):
+        colab_runner.check_single_active('new', 1, ['existing'])
+    # 复用自己的 session 名不构成“他人实例”：不阻碍对既有实例的操作
+    assert colab_runner.check_single_active('existing', 1, ['existing']) == []
+    # limit=2 时 1 个他人实例放行
+    assert colab_runner.check_single_active('new', 2, ['existing']) == ['existing']
+
+
+def test_check_single_active_never_stops_or_kills(monkeypatch):
+    """守卫拒绝时只抛错：绝不调用 stop/shutdown。"""
+    def deny_shutdown(session):
+        raise AssertionError('guard must not stop any instance')
+    monkeypatch.setattr(colab_runner, 'shutdown', deny_shutdown)
+    with pytest.raises(core.BridgeError):
+        colab_runner.check_single_active('new', 1, ['busy'])
+
+
+def test_launch_guard_refuses_before_new_and_without_local_record(tmp_path, monkeypatch):
+    """已有他人活跃实例 ⇒ 在 `colab new` 之前拒绝，且不留本地任务记录。"""
+    _prepare_project(tmp_path, monkeypatch)
+    calls = []
+    monkeypatch.setattr(colab_runner, 'cli',
+                        lambda *a, **k: calls.append(a) or subprocess.CompletedProcess(a, 0))
+    monkeypatch.setattr(colab_runner, 'list_active_sessions', lambda: ['mlb-other-0000'])
+    with pytest.raises(core.BridgeError, match='单实例策略拒绝分配'):
+        colab_runner.launch('demo', 'example', [], 'L4', allow_empty_input=True)
+    assert not any(c[0] == 'new' for c in calls)
+    assert not list((core.state_dir() / 'jobs').glob('*.json'))
+
+
+def test_launch_guard_cli_failure_is_refusal_not_retry(tmp_path, monkeypatch):
+    """`colab sessions` 本身失败 ⇒ 拒绝分配（不重试、不分配、不清理）。"""
+    _prepare_project(tmp_path, monkeypatch)
+    monkeypatch.setattr(colab_runner, 'list_active_sessions', _REAL_LIST_ACTIVE)
+    calls = []
+    sleeps = []
+    monkeypatch.setattr(colab_runner.time, 'sleep', sleeps.append)
+
+    def fake_cli(*args, capture=False, timeout=None):
+        calls.append(args)
+        if args[0] == 'sessions':
+            raise core.BridgeError('read timeout')
+        return subprocess.CompletedProcess(args, 0)
+    monkeypatch.setattr(colab_runner, 'cli', fake_cli)
+    with pytest.raises(core.BridgeError, match='read timeout'):
+        colab_runner.launch('demo', 'example', [], 'L4', allow_empty_input=True)
+    assert [c[0] for c in calls] == ['sessions']  # 绝不走到 new
+    assert sleeps == []  # 无重试
+    assert not list((core.state_dir() / 'jobs').glob('*.json'))
+
+
+def test_launch_queries_sessions_before_new(tmp_path, monkeypatch):
+    """正常路径：launch 先查 sessions（守卫）再分配 new。"""
+    _prepare_project(tmp_path, monkeypatch)
+    monkeypatch.setattr(colab_runner, 'list_active_sessions', _REAL_LIST_ACTIVE)
+    order = []
+
+    def fake_cli(*args, capture=False, timeout=None):
+        order.append(args[0])
+        if args[0] == 'sessions':
+            return subprocess.CompletedProcess(
+                args, 0, stdout='[colab] No active sessions found on server.\n')
+        return subprocess.CompletedProcess(args, 0)
+    monkeypatch.setattr(colab_runner, 'cli', fake_cli)
+    monkeypatch.setattr(colab_runner, 'stage', lambda *a: None)
+    monkeypatch.setattr(colab_runner, 'put_script', lambda *a: None)
+    session = colab_runner.launch('demo', 'example', [], 'L4', allow_empty_input=True)
+    assert order.index('sessions') < order.index('new')
+    assert order.count('new') == 1
+    assert colab_runner.get_local(session)['stopped'] is False
+
+
+def test_launch_max_active_sessions_zero_disables_guard(tmp_path, monkeypatch):
+    """--max-active-sessions 0 ⇒ 显式关闭检查，完全不查询 sessions。"""
+    _prepare_project(tmp_path, monkeypatch)
+    calls = []
+
+    def fake_cli(*args, capture=False, timeout=None):
+        calls.append(args)
+        if args[0] == 'sessions':
+            raise AssertionError('limit=0 must not query sessions')
+        return subprocess.CompletedProcess(args, 0)
+    monkeypatch.setattr(colab_runner, 'cli', fake_cli)
+    monkeypatch.setattr(colab_runner, 'stage', lambda *a: None)
+    monkeypatch.setattr(colab_runner, 'put_script', lambda *a: None)
+    colab_runner.launch('demo', 'example', [], 'L4', allow_empty_input=True,
+                        max_active_sessions=0)
+    assert any(c[0] == 'new' for c in calls)
+
+
+def test_launch_negative_limit_rejected(tmp_path, monkeypatch):
+    _prepare_project(tmp_path, monkeypatch)
+    monkeypatch.setattr(colab_runner, 'cli',
+                        lambda *a, **k: subprocess.CompletedProcess(a, 0))
+    with pytest.raises(core.BridgeError, match='max-active-sessions'):
+        colab_runner.launch('demo', 'example', [], 'L4', allow_empty_input=True,
+                            max_active_sessions=-1)
+
+
+def test_launch_configured_limit_from_settings(tmp_path, monkeypatch):
+    """settings.toml [colab].max_active_sessions=2 ⇒ 允许第 2 个实例。"""
+    _prepare_project(tmp_path, monkeypatch)
+    with (core.config_dir() / 'settings.toml').open('a') as f:
+        f.write('\n[colab]\ndefault_gpu="L4"\nmax_active_sessions=2\n')
+    monkeypatch.setattr(colab_runner, 'list_active_sessions', lambda: ['one'])
+    monkeypatch.setattr(colab_runner, 'cli',
+                        lambda *a, **k: subprocess.CompletedProcess(a, 0))
+    monkeypatch.setattr(colab_runner, 'stage', lambda *a: None)
+    monkeypatch.setattr(colab_runner, 'put_script', lambda *a: None)
+    # 1 个他人实例 < limit 2 ⇒ 放行
+    session = colab_runner.launch('demo', 'example', [], allow_empty_input=True)
+    assert colab_runner.get_local(session)['stopped'] is False
+    # 同样的活跃列表 + limit 1 ⇒ 拒绝
+    with (core.config_dir() / 'settings.toml').open('a') as f:
+        f.write('\nmax_active_sessions=1\n')  # 顶层重复键？不行——改用独立测试
+
+
+def test_launch_configured_limit_one_refuses(tmp_path, monkeypatch):
+    """settings.toml [colab].max_active_sessions=1（缺省）+ 1 个他人实例 ⇒ 拒绝。"""
+    _prepare_project(tmp_path, monkeypatch)
+    with (core.config_dir() / 'settings.toml').open('a') as f:
+        f.write('\n[colab]\ndefault_gpu="L4"\nmax_active_sessions=1\n')
+    monkeypatch.setattr(colab_runner, 'list_active_sessions', lambda: ['one'])
+    monkeypatch.setattr(colab_runner, 'cli',
+                        lambda *a, **k: subprocess.CompletedProcess(a, 0))
+    with pytest.raises(core.BridgeError, match='单实例策略拒绝分配'):
+        colab_runner.launch('demo', 'example', [], allow_empty_input=True)
+
+
+def test_launch_lock_file_created_and_released(tmp_path, monkeypatch):
+    """跨进程 flock：锁文件在 state 目录下创建，且可重复获取（无死锁）。"""
+    _prepare_project(tmp_path, monkeypatch)
+    monkeypatch.setattr(colab_runner, 'cli',
+                        lambda *a, **k: subprocess.CompletedProcess(a, 0))
+    monkeypatch.setattr(colab_runner, 'stage', lambda *a: None)
+    monkeypatch.setattr(colab_runner, 'put_script', lambda *a: None)
+    colab_runner.launch('demo', 'example', [], 'CPU', allow_empty_input=True)
+    colab_runner.launch('demo', 'example', [], 'CPU', allow_empty_input=True,
+                        max_active_sessions=0)
+    assert (core.state_dir() / 'launch.lock').exists()
+
+
+def test_watch_records_last_known_and_terminal_diagnostic(tmp_path, monkeypatch):
+    """watch 观测写入本地 last-known；终态另存诊断文件（无凭据）。"""
+    colab_runner.store_local('job', {'stopped': False})
+    monkeypatch.setattr(colab_runner, 'get_status',
+                        lambda s: {'phase': 'FAILED', 'error': 'RuntimeError: boom'})
+    monkeypatch.setattr(colab_runner, 'shutdown',
+                        lambda s: (_ for _ in ()).throw(AssertionError('must not stop')))
+    result = colab_runner.watch('job', interval=5)
+    assert result['phase'] == 'FAILED'
+    record = colab_runner.get_local('job')
+    assert record['last_known']['phase'] == 'FAILED' and 'observed' in record['last_known']
+    diag_path = colab_runner.diagnostic_path('job')
+    assert diag_path.is_file()
+    payload = json.loads(diag_path.read_text())
+    assert payload['terminal']['error'] == 'RuntimeError: boom'
+    assert '不构成' in payload['note']
+    blob = diag_path.read_text()
+    assert 'password' not in blob.lower() and 'token' not in blob.lower()
+
+
+def test_record_observation_ignores_missing_record():
+    """没有本地记录时（如手工观察未知 session）静默跳过，绝不上抛。"""
+    colab_runner.record_observation('ghost', {'phase': 'RUNNING'})  # 不应抛错

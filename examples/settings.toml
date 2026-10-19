@@ -4,3 +4,10 @@ remote = "gdrive"            # 已经认证的 rclone remote 名称
 prefix = "mlbridge"          # 每个 project 分离一个 restic 仓库
 password_file = "/home/user/.config/mlbridge/restic-password"
 rclone_config = "/home/user/.config/rclone/rclone.conf"
+
+[colab]
+default_gpu = "L4"
+high_mem = false
+# 单实例分配守卫：run 在 colab new 前用 `colab sessions` 核对活跃实例数，
+# 超过上限即拒绝（不重试、不停止任何实例）。0 = 关闭检查。
+max_active_sessions = 1

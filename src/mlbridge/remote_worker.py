@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,19 +20,69 @@ PLAN = BASE / 'mlbridge_job.json'
 # Optional private-repository credentials staged by colab_runner.launch().
 GIT_AUTH = 'mlbridge_git_auth'
 GIT_ASKPASS = 'mlbridge_git_askpass.sh'
+# 心跳：RUNNING/PUBLISHING 期间周期性刷新本地状态文件（有界间隔）。
+# 心跳不能阻止 VM 消失（/content 仍可能整体丢失）；它的价值是本地把
+# “最后看到”与“当前”区分开（配合本地 last-known 记录）。
+HEARTBEAT_INTERVAL = 300  # 秒；有界
+HEARTBEAT_PHASES = frozenset({'RUNNING', 'PUBLISHING'})
+
+# 状态文件只有一个写入契约：串行化读-改-写 + 原子替换，避免主线程终态
+# 与心跳线程互相覆盖字段（2026-10-19 双 A100 实例丢失事故的教训之一）。
+_WRITE_LOCK = threading.Lock()
 
 
-def status(phase, **fields):
-    info = {}
-    if STATE.exists():
-        try:
-            info = json.loads(STATE.read_text())
-        except (ValueError, OSError):
-            pass
-    info.update(phase=phase, updated=datetime.now(timezone.utc).isoformat(), **fields)
+def _atomic_write(info: dict) -> None:
     temp = STATE.with_suffix('.tmp')
     temp.write_text(json.dumps(info, ensure_ascii=False, indent=2))
     temp.replace(STATE)
+
+
+def status(phase, **fields):
+    with _WRITE_LOCK:
+        info = {}
+        if STATE.exists():
+            try:
+                info = json.loads(STATE.read_text())
+            except (ValueError, OSError):
+                pass
+        # status() 只在阶段变更时被调用：终态保留最后一次 heartbeat
+        # 时间戳是有价值的诊断信息（worker 活到何时），不在这里丢弃。
+        info.update(phase=phase, updated=datetime.now(timezone.utc).isoformat(), **fields)
+        _atomic_write(info)
+
+
+def _heartbeat_once() -> bool:
+    """单次心跳步进：仅当当前阶段在 HEARTBEAT_PHASES 时刷新时间戳。
+
+    返回是否写了状态文件。绝不修改 phase 及其他字段，因此不会与主线程
+    写入的终态（SUCCEEDED/FAILED）竞态覆盖。
+    """
+    with _WRITE_LOCK:
+        try:
+            if not STATE.exists():
+                return False
+            info = json.loads(STATE.read_text())
+            if info.get('phase') not in HEARTBEAT_PHASES:
+                return False
+            info['heartbeat'] = datetime.now(timezone.utc).isoformat()
+            _atomic_write(info)
+            return True
+        except (ValueError, OSError):
+            return False
+
+
+def _start_heartbeat() -> threading.Thread:
+    def beat():
+        while True:
+            time.sleep(HEARTBEAT_INTERVAL)
+            try:
+                _heartbeat_once()
+            except Exception:  # 心跳绝不能杀死 worker
+                continue
+
+    thread = threading.Thread(target=beat, daemon=True, name='mlbridge-heartbeat')
+    thread.start()
+    return thread
 
 
 def run(args, *, cwd=None, env=None):
@@ -91,6 +142,7 @@ def restore_args(mode: str = 'always') -> list[str]:
 
 
 def main():
+    _start_heartbeat()
     try:
         plan = json.loads(PLAN.read_text())
         os.chmod(BASE / 'mlbridge_rclone.conf', 0o600)

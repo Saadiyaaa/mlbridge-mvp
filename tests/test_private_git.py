@@ -33,6 +33,8 @@ def no_real_credentials(monkeypatch, tmp_path):
 @pytest.fixture(autouse=True)
 def isolated_state(tmp_path, monkeypatch):
     monkeypatch.setenv('XDG_STATE_HOME', str(tmp_path / 'state'))
+    # 单实例守卫打桩为空：本文件只测私有仓库 staging，不测守卫。
+    monkeypatch.setattr(colab_runner, 'list_active_sessions', lambda: [])
 
 
 def _prepare_project(tmp_path, monkeypatch, repository=GOOD_URL):

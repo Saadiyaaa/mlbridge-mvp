@@ -198,3 +198,88 @@ def test_worker_cleans_dirty_workspace_before_clone(tmp_path, monkeypatch):
     assert state['phase'] == 'SUCCEEDED'
     assert not (dirty_ws / 'dirty_file.txt').exists()
 
+
+
+# ---------------------------------------------------------------------------
+# 心跳：RUNNING/PUBLISHING 有界间隔刷新；终态绝不被覆盖；写入串行化
+# ---------------------------------------------------------------------------
+
+def test_heartbeat_once_only_during_running_or_publishing(tmp_path, monkeypatch):
+    state = tmp_path / 'state.json'
+    monkeypatch.setattr(remote_worker, 'STATE', state)
+    remote_worker.status('RUNNING')
+    assert remote_worker._heartbeat_once() is True
+    info = json.loads(state.read_text())
+    assert info['phase'] == 'RUNNING' and 'heartbeat' in info
+    # 终态后心跳绝不再写（不会与主线程终态竞态覆盖）
+    remote_worker.status('SUCCEEDED', snapshot_id='a' * 64)
+    after_success = json.loads(state.read_text())
+    assert after_success['phase'] == 'SUCCEEDED'
+    # RUNNING 阶段的最后一次 heartbeat 保留在终态里（worker 活到何时的证据）
+    assert 'heartbeat' in after_success
+    assert remote_worker._heartbeat_once() is False
+    assert json.loads(state.read_text()) == after_success  # 终态文件完全未被改动
+
+
+def test_heartbeat_once_survives_missing_or_corrupt_state(tmp_path, monkeypatch):
+    state = tmp_path / 'state.json'
+    monkeypatch.setattr(remote_worker, 'STATE', state)
+    assert remote_worker._heartbeat_once() is False  # 不存在 ⇒ False，不抛错
+    state.write_text('{not json')
+    assert remote_worker._heartbeat_once() is False  # 损坏 ⇒ False，不抛错
+
+
+def test_status_concurrent_writes_are_serialized_and_atomic(tmp_path, monkeypatch):
+    """多线程并发 status() ⇒ 状态文件始终是合法 JSON 且无 .tmp 残留。"""
+    import concurrent.futures
+    state = tmp_path / 'state.json'
+    monkeypatch.setattr(remote_worker, 'STATE', state)
+    remote_worker.status('RUNNING')
+    def hammer(i):
+        for j in range(20):
+            remote_worker.status('RUNNING', worker=i, tick=j)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(hammer, range(8)))
+    info = json.loads(state.read_text())
+    assert info['phase'] == 'RUNNING'
+    assert not state.with_suffix('.tmp').exists()
+
+
+def test_worker_writes_heartbeat_during_long_running(tmp_path, monkeypatch):
+    """命令运行期间心跳线程按有界间隔刷新 heartbeat 字段。"""
+    import time as _time
+    repo = tmp_path / 'git-src'
+    repo.mkdir()
+    subprocess.run(['git', 'init', '-q', str(repo)], check=True)
+    subprocess.run(['git', '-C', str(repo), 'config', 'user.name', 'T'], check=True)
+    subprocess.run(['git', '-C', str(repo), 'config', 'user.email', 't@e.c'], check=True)
+    (repo / 'run.py').write_text("import time\nprint('x')\ntime.sleep(0.5)\n")
+    subprocess.run(['git', '-C', str(repo), 'add', '.'], check=True)
+    subprocess.run(['git', '-C', str(repo), 'commit', '-qm', 'init'], check=True)
+    commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=repo,
+                                     text=True).strip()
+    base = tmp_path / 'remote-root'
+    base.mkdir()
+    (base / 'mlbridge_rclone.conf').write_text('[gdrive]\ntype=drive\n')
+    (base / 'mlbridge_restic_password').write_text('test')
+    plan = {'job_id': 'hb', 'session': 'hb', 'project': 'demo',
+            'repository': str(repo), 'commit': commit,
+            'restic_repository': 'rclone:gdrive:store/demo',
+            'inputs': [], 'setup': [],
+            'command': [sys.executable, 'run.py'], 'outputs': []}
+    (base / 'mlbridge_job.json').write_text(json.dumps(plan))
+    fakebin = tmp_path / 'fakebin'
+    fakebin.mkdir()
+    (fakebin / 'restic').write_text('#!/bin/sh\necho "restic 0.17.0"\n')
+    (fakebin / 'restic').chmod(0o755)
+    (fakebin / 'rclone').write_text('#!/bin/sh\nexit 0\n')
+    (fakebin / 'rclone').chmod(0o755)
+    monkeypatch.setenv('PATH', str(fakebin) + os.pathsep + os.environ['PATH'])
+    monkeypatch.setattr(remote_worker, 'BASE', base)
+    monkeypatch.setattr(remote_worker, 'STATE', base / 'mlbridge_state.json')
+    monkeypatch.setattr(remote_worker, 'PLAN', base / 'mlbridge_job.json')
+    monkeypatch.setattr(remote_worker, 'HEARTBEAT_INTERVAL', 0.05)
+    remote_worker.main()
+    state = json.loads((base / 'mlbridge_state.json').read_text())
+    assert state['phase'] == 'SUCCEEDED'  # 终态不被心跳覆盖
+    assert 'heartbeat' in state           # 运行期间心跳已写入过

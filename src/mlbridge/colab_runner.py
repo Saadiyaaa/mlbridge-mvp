@@ -4,6 +4,8 @@ The ML process is detached *inside Colab* and does not depend on SSH lifetime.
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import re
@@ -13,11 +15,13 @@ import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
-from .core import (BridgeError, default_gpu, default_high_mem, expand, git_commit,
-                   GPU_CHOICES, job_spec, proc, project, repo_url, settings, secret_env,
-                   SNAPSHOT, state_dir)
+from .core import (BridgeError, default_gpu, default_high_mem,
+                   default_max_active_sessions, expand, git_commit,
+                   GPU_CHOICES, job_spec, proc, project, repo_url, settings,
+                   secret_env, SNAPSHOT, state_dir)
 
 FINAL = {'SUCCEEDED', 'FAILED'}
 SESSION = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$')
@@ -31,6 +35,7 @@ EXEC_TIMEOUT = 300      # 单次 exec：staging 脚本均微小，正常 <10s
 UPLOAD_TIMEOUT = 300    # 单次 upload：staging 文件均为 KB 级
 ALLOC_TIMEOUT = 900     # new：A100 分配可能排队，但仍须有界
 STOP_TIMEOUT = 120
+SESSIONS_TIMEOUT = 60   # sessions：只读控制面查询，必须有界
 STAGE_ATTEMPTS = 3
 STAGE_BACKOFF = 5
 # remote_worker 启动后写的状态阶段；出现即说明 worker 已在 VM 上运行。
@@ -103,6 +108,74 @@ def cli_retry(*args, timeout, attempts=STAGE_ATTEMPTS, backoff=STAGE_BACKOFF):
         f'{last}') from last
 
 
+# colab sessions 输出：空为 "[colab] No active sessions found on server."；
+# 每个活跃 session 一行 "[name] endpoint | Hardware: … | Shape: … | Variant: …"。
+_NO_SESSIONS_MARKER = 'no active sessions'
+_SESSION_LINE = re.compile(r'^\[([^\]]+)\]\s*(\S+)')
+
+
+def list_active_sessions() -> list[str]:
+    """向 colab 控制面查询当前活跃 session（服务器权威），fail-closed 解析。
+
+    任何 CLI 失败、超时、或无法识别的输出都抛 BridgeError（视为“拒绝
+    分配”），绝不猜测为空、绝不重试、绝不 kill/stop 已有实例。
+    """
+    r = cli('sessions', capture=True, timeout=SESSIONS_TIMEOUT)
+    out = r.stdout or ''
+    if _NO_SESSIONS_MARKER in out.lower():
+        return []
+    names: list[str] = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        m = _SESSION_LINE.match(line)
+        if not m:
+            raise BridgeError(
+                f'无法解析 colab sessions 输出（格式可能已变化），按未知处理: {line[:120]}')
+        names.append(m.group(1))
+    if not names:
+        raise BridgeError('colab sessions 输出既非空也无活跃 session 行，按未知处理')
+    return names
+
+
+def check_single_active(own: str, limit: int, active: list[str] | None = None) -> list[str]:
+    """单实例分配守卫：超过上限时抛错拒绝，不做任何清理动作。
+
+    own（本次要分配的 session）不算他人实例；这样 --session 复用既有
+    名字时不会阻碍对已有实例的后续操作。limit<=0 直接放行。
+    """
+    if limit <= 0:
+        return []
+    others = [s for s in (list_active_sessions() if active is None else active)
+              if s != own]
+    if len(others) >= limit:
+        raise BridgeError(
+            f'单实例策略拒绝分配（max_active_sessions={limit}）：'
+            f'已有活跃 session {others}。请先用 `colab sessions` / `mlbridge status` '
+            f'确认这些实例是否还在使用；确认后用 `mlbridge stop <session>` 手动释放，'
+            f'再重新提交。不要盲目重试本命令；本工具不会代替你停止任何实例。')
+    return others
+
+
+@contextlib.contextmanager
+def _launch_lock():
+    """跨进程互斥：同一台机器上的并发 mlbridge run 串行化（检查+分配）。
+
+    只覆盖本工具自身的并发窗口；与其他工具/其他用户直接调用 `colab new`
+    之间仍存在 TOCTOU 竞态（见 README 局限说明）。
+    """
+    path = state_dir() / 'launch.lock'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_WRONLY, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
 def get_status(session: str) -> dict:
     with tempfile.TemporaryDirectory(prefix='mlbridge-status-') as t:
         dest = Path(t) / 'state.json'
@@ -112,6 +185,53 @@ def get_status(session: str) -> dict:
             return json.loads(dest.read_text())
         except (BridgeError, ValueError, OSError) as exc:
             return {'phase': 'UNREACHABLE', 'reason': str(exc)}
+
+
+def record_observation(session: str, status: dict) -> None:
+    """把最近一次远端观测写入本地任务记录（last-known state，尽力而为）。
+
+    VM 消失后 /content 不可恢复；本地 last-known 至少保留最后一次看到的
+    阶段/时间戳，供 status/watch 判断“消失前在干什么”。绝不把它当作
+    远端当前状态。
+    """
+    try:
+        record = get_local(session)
+        record['last_known'] = {
+            **status,
+            'observed': datetime.now(timezone.utc).isoformat(),
+        }
+        store_local(session, record)
+    except BridgeError:
+        pass
+
+
+def diagnostic_path(session: str) -> Path:
+    return state_dir() / 'diagnostics' / f'{session}.json'
+
+
+def save_terminal_diagnostic(session: str, status: dict) -> bool:
+    """把远端自报的终态（SUCCEEDED/FAILED 及 error/snapshot_id）另存本地。
+
+    这是“远端在断开前自报了什么”的记录，不是本地对远端成功或数据完整
+    的独立证明；独立验证请用 `mlbridge artifacts` 核对 restic snapshot。
+    仅本地落盘（0600），不上传存储、不写任何凭据。失败时静默放弃。
+    """
+    if not SESSION.fullmatch(session):
+        return False
+    try:
+        path = diagnostic_path(session)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            'session': session,
+            'written': datetime.now(timezone.utc).isoformat(),
+            'terminal': status,
+            'note': '远端自报终态的本地副本；不构成对远端成功/数据完整的独立证明',
+        }
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+        path.chmod(0o600)
+        return True
+    except OSError:
+        return False
 
 
 def shutdown(session: str) -> None:
@@ -348,8 +468,8 @@ def _staging_failed(session: str, starter_sent: bool) -> None:
 
 def launch(name: str, job: str, inputs: list[str], gpu: str | None = None,
            *, high_mem: bool | None = None, allow_dirty: bool = False,
-           session: str | None = None,
-           allow_empty_input: bool = False) -> str:
+           session: str | None = None, allow_empty_input: bool = False,
+           max_active_sessions: int | None = None) -> str:
     cfg = project(name)
     store = settings()
     # Preflight: do not start a GPU for missing credentials or a malformed
@@ -389,20 +509,29 @@ def launch(name: str, job: str, inputs: list[str], gpu: str | None = None,
     if use_high_mem:
         request.append('--high-mem')
     # 先写本地记录再分配：即使 new 本身挂死/失败，也存在可 stop/审计的记录。
-    store_local(session, {'project': name, 'job': job, 'session': session,
-                          'git_commit': commit, 'inputs': inputs, 'stopped': False})
-    try:
-        cli(*request, timeout=ALLOC_TIMEOUT)
-    except BridgeError:
-        # 分配失败绝不重试 new（避免复制计费实例）；若实例实际已创建，
-        # stop 是幂等的，最坏情况只是对不存在的 session 空跑一次。
+    # 单实例守卫在 `colab new` 之前执行；guard 失败 ⇒ 不写本地记录、不分配、
+    # 不 stop 任何实例。检查与分配在跨进程 flock 内串行，收敛同机并发窗口。
+    limit = (default_max_active_sessions() if max_active_sessions is None
+             else max_active_sessions)
+    if max_active_sessions is not None and max_active_sessions < 0:
+        raise BridgeError('--max-active-sessions 必须是非负整数（0=关闭检查）')
+    with _launch_lock():
+        if limit > 0:
+            check_single_active(session, limit)
+        store_local(session, {'project': name, 'job': job, 'session': session,
+                              'git_commit': commit, 'inputs': inputs, 'stopped': False})
         try:
-            shutdown(session)
+            cli(*request, timeout=ALLOC_TIMEOUT)
         except BridgeError:
-            pass
-        print(f'[mlbridge] 分配失败或超时；若实例实际已创建请用 colab sessions '
-              f'检查并 mlbridge stop {session}。', file=sys.stderr, flush=True)
-        raise
+            # 分配失败绝不重试 new（避免复制计费实例）；若实例实际已创建，
+            # stop 是幂等的，最坏情况只是对不存在的 session 空跑一次。
+            try:
+                shutdown(session)
+            except BridgeError:
+                pass
+            print(f'[mlbridge] 分配失败或超时；若实例实际已创建请用 colab sessions '
+                  f'检查并 mlbridge stop {session}。', file=sys.stderr, flush=True)
+            raise
     try:
         # These are tiny files, not the large dataset.
         starter_sent = False
@@ -464,6 +593,7 @@ def watch(session: str, *, interval: int = 20, auto_stop: bool = True) -> dict:
     count = 0
     while True:
         status = get_status(session)
+        record_observation(session, status)
         phase = status.get('phase', 'UNKNOWN')
         print(f'[mlbridge] {session}: {phase}', flush=True)
         if phase in FINAL:
@@ -473,6 +603,7 @@ def watch(session: str, *, interval: int = 20, auto_stop: bool = True) -> dict:
                 store_local(session, record)
             except BridgeError:
                 pass
+            save_terminal_diagnostic(session, status)
             if phase == 'SUCCEEDED':
                 return _finish_success(session, status, auto_stop)
             print('[mlbridge] 运行失败；保留 Colab 供排查。请手动停止以免持续计费。', flush=True)

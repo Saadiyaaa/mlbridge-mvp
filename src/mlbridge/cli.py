@@ -43,6 +43,9 @@ def parser() -> argparse.ArgumentParser:
     x.add_argument('--high-mem', action=argparse.BooleanOptionalAction, default=None,
                    help='请求高内存机型（如 A100）；--no-high-mem 可覆盖配置，省略时读取 [colab].high_mem')
     x.add_argument('--session')
+    x.add_argument('--max-active-sessions', type=int, default=None,
+                   help='单实例守卫：分配前用 `colab sessions` 核对活跃实例数，超过则拒绝（不做任何清理）。'
+                        '默认读 settings.toml [colab].max_active_sessions（缺省 1）；0 关闭检查')
     x.add_argument('--detach', action='store_true', help='不等待；之后用 watch 监视/自动停止')
     x.add_argument('--allow-dirty', action='store_true', help='使用 HEAD，忽略本地未提交代码变更')
     x.add_argument('--allow-empty-input', action='store_true', help='明确确认该任务无需输入快照')
@@ -125,7 +128,8 @@ def execute(args):
     elif a == 'run':
         session = launch(args.project, args.job, args.input, args.gpu,
                          high_mem=args.high_mem, allow_dirty=args.allow_dirty, session=args.session,
-                         allow_empty_input=args.allow_empty_input)
+                         allow_empty_input=args.allow_empty_input,
+                         max_active_sessions=args.max_active_sessions)
         print('任务已独立启动，session:', session, flush=True)
         print(f'调试：colab ssh -s {session} （不要用 --rm）', flush=True)
         if not args.detach:
@@ -144,6 +148,10 @@ def execute(args):
             record = None
         current = (record.get('result') if record and record.get('stopped') and record.get('result')
                    else get_status(args.session))
+        if (current.get('phase') == 'UNREACHABLE' and record and record.get('last_known')):
+            # VM 消失 ≠ 运行失败：当前状态仍是 UNREACHABLE，另附消失前
+            # 最后一次看到的远端状态供人工判断。
+            current = {**current, 'last_known': record['last_known']}
         print('Colab 状态:', json.dumps(current, ensure_ascii=False, indent=2))
     elif a == 'logs':
         logs(args.session, lines=args.lines)

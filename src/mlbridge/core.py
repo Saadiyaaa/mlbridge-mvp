@@ -97,6 +97,19 @@ def default_high_mem() -> bool:
     return high_mem
 
 
+def default_max_active_sessions() -> int:
+    """单实例守卫的默认上限；旧配置缺省为 1（保守策略）。
+
+    0 表示显式关闭该检查（例如多实例由用户自行管理）。负数与非法
+    类型一律拒绝，绝不静默放宽。
+    """
+    value = _colab_settings().get("max_active_sessions", 1)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise BridgeError(
+            "settings.toml 的 colab.max_active_sessions 必须是非负整数（0=关闭检查）")
+    return value
+
+
 def expand(v: str) -> Path:
     return Path(os.path.expandvars(v)).expanduser().resolve()
 

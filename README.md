@@ -152,6 +152,10 @@ mlbridge run image-project --job upstream --input a48f93bc21e78491029c782138a0f9
 
 使用 `run --detach` 后须继续执行 `mlbridge watch <session>`（或手动 `mlbridge stop <session>`）；远端 Worker 不主动关停实例。若无人接管，实例可能持续计费。`watch --no-stop` 会保留成功实例，需自行关停。
 
+**单实例分配守卫（默认开启，上限 1）**：`run` 在 `colab new` 之前会以 `colab sessions`（服务器权威）核对当前活跃实例数；已有其他活跃 session 时拒绝分配，不重试、不停止任何实例、不留本地任务记录。CLI 失败、超时或输出格式无法识别一律视为拒绝（fail-closed），请手动运行 `colab sessions` 确认后再重试。上限取自 `settings.toml` 的 `[colab].max_active_sessions`（缺省 `1`；`0` 关闭检查），也可在每次提交时用 `--max-active-sessions <n>` 显式指定。复用 `--session` 指向既有实例不会被该守卫阻碍。已知局限：守卫与 `colab new` 之间存在 TOCTOU 竞态；本地 flock（状态目录 `launch.lock`）只串行化同一台机器上 MLBridge 自身的并发提交，无法约束其他工具或用户直接调用 `colab new`。守卫只阻止新分配；它不能恢复已消失的实例或其中 `/content` 的数据。
+
+**心跳与本地 last-known 状态**：远端 Worker 在 RUNNING/PUBLISHING 阶段以有界间隔（默认 300 秒）刷新 `/content/mlbridge_state.json` 的 `heartbeat` 时间戳（线程锁串行化所有状态写入，终态不会被心跳覆盖）。VM 消失时 `/content` 不可恢复；本地 `watch` 会把每次观测写入任务记录的 `last_known`，`mlbridge status <session>` 在远端不可达时仍报告 `UNREACHABLE`（绝不误报 FAILED）并附带 `last_known`，供判断“消失前在干什么”。终态（SUCCEEDED/FAILED 及 error/snapshot_id）会另存到本地状态目录 `diagnostics/<session>.json`（0600），这是“远端断开前自报了什么”的记录，不构成对远端成功或数据完整的独立证明；独立验证请用 `mlbridge artifacts` 核对 restic 快照。诊断文件只存本地，不上传存储、不含凭据；若需异地保存请自行处理，不要在日志中记录凭据。
+
 **私有 GitHub 仓库**：`repository` 与 Git remote 均保持不带凭据的 `https://github.com/<owner>/<repo>.git`。本地默认读取 `~/.config/zsh/private/secrets.env` 中的 `MLBRIDGE_GITHUB_USERNAME=...`（GitHub 用户名）和 `MLBRIDGE_GITHUB_TOKEN=...`（有该仓库 Contents 读取权限的 fine-grained PAT）；也可为本次进程同时设置两个同名环境变量，覆盖文件中的值。不必把这两个变量先 `export` 到 shell 环境。文件须属于当前用户、是普通文件且权限不高于 `0600`；解析使用 `awk` 提取两条简单赋值（可带 `export` 或整值单/双引号），**不会 source/eval 文件**，不展开 `$VAR` 或命令替换。两个来源不会拼接，只提供用户名或只提供 token 会在创建实例前报错；都没有时走公开仓库路径。不要把 token 写入项目配置、命令参数、远端 URL、脚本或提交到 Git。MLBridge 将 token 放进权限 0600 的临时文件，通过 Colab 上传，克隆时由 `GIT_ASKPASS` 读取，克隆成功或失败后立即清理；不会传给 MyPure 的 `setup`/`command` 环境。文件中的令牌只在需要 `run` 时读取，不会由 `publish`/`doctor` 读取；若本机该文件默认可用，运行公开仓库任务也会上传此令牌，建议仅在信任的作业环境使用该默认文件。Colab 远端属于可执行项目代码的同一 OS 用户，上传至克隆期间和控制通道异常时不能承诺绝对隔离或可靠擦除；本地进程被强制杀死也可能留下权限为 0600 的临时凭据文件，须在本地临时目录检查并删除；请使用最小授权、限定仓库的可撤销 token。SSH URL、其他 Git 服务及 Git LFS/submodule 的二次鉴权不在此通道内。Git 预检仍要求本地仓库有匹配 URL 的 upstream、HEAD 已推送且已跟踪文件干净；不要把 `--allow-dirty` 当作正常流程。
 
 ### 6. 拉取输出产物
@@ -173,7 +177,7 @@ mlbridge fetch image-project <output_snapshot_id>
 | `publish` | `<project> --label <tag> --path <rel_path> [--no-materialize-links]` | 默认物化显式选中的软链接并按相对路径发布；可多次 `--path` |
 | `artifacts`| `<project>` | 列出该项目在云端存储中的全部历史快照与标签 |
 | `fetch` | `<project> <snapshot_id> [--target <path>] [--overwrite]` | 将指定快照恢复至本地目标目录 |
-| `run` | `<project> [--job <name>] [--input <id>] [--gpu <type>] [--high-mem\|--no-high-mem] [--detach]` | GPU 与高内存默认值取自 `[colab]`；detach 后须自行 watch/stop |
+| `run` | `<project> [--job <name>] [--input <id>] [--gpu <type>] [--high-mem\|--no-high-mem] [--detach] [--max-active-sessions <n>]` | GPU 与高内存默认值取自 `[colab]`；单实例守卫默认上限 1（`0` 关闭）；detach 后须自行 watch/stop |
 | `status` | `<session>` | 查询指定会话的本地记录及远端运行状态 |
 | `logs` | `<session> [--lines <n>]` | 读取远端任务日志末尾内容 |
 | `watch` | `<session> [--interval <s>] [--no-stop]` | 连接已提交的后台任务并持续追踪直至结束 |

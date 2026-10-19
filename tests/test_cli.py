@@ -140,3 +140,33 @@ def test_run_stop_failure_returns_nonzero_even_after_success(monkeypatch):
                         lambda *args, **kwargs: {'phase': 'SUCCEEDED',
                                                  'stop_error': 'network timeout'})
     assert cli.execute(cli.parser().parse_args(['run', 'demo'])) == 1
+
+
+def test_run_parses_and_passes_max_active_sessions(monkeypatch):
+    seen = {}
+    def fake_launch(*args, **kwargs):
+        seen.update(kwargs)
+        return 'session'
+    monkeypatch.setattr(cli, 'launch', fake_launch)
+    argv = ['run', 'demo', '--detach', '--max-active-sessions', '1']
+    assert cli.execute(cli.parser().parse_args(argv)) == 0
+    assert seen['max_active_sessions'] == 1
+    # 缺省时不覆盖（None ⇒ 由 settings.toml 决定）
+    assert cli.parser().parse_args(['run', 'demo']).max_active_sessions is None
+
+
+def test_status_unreachable_keeps_phase_and_attaches_last_known(tmp_path, monkeypatch,
+                                                                capsys):
+    """VM 消失 ⇒ 当前状态仍是 UNREACHABLE，另附 last-known，不误报 FAILED。"""
+    import json as _json
+    import mlbridge.colab_runner as runner
+    monkeypatch.setenv('XDG_STATE_HOME', str(tmp_path / 'state'))
+    runner.store_local('ghost', {
+        'stopped': False,
+        'last_known': {'phase': 'RUNNING', 'observed': '2026-10-19T03:00:00+00:00'}})
+    monkeypatch.setattr(cli, 'get_status',
+                        lambda s: {'phase': 'UNREACHABLE', 'reason': 'download failed'})
+    assert cli.execute(cli.parser().parse_args(['status', 'ghost'])) == 0
+    out = _json.loads(capsys.readouterr().out.split('Colab 状态:')[1])
+    assert out['phase'] == 'UNREACHABLE'
+    assert out['last_known']['phase'] == 'RUNNING'
