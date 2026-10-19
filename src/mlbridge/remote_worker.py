@@ -20,14 +20,11 @@ PLAN = BASE / 'mlbridge_job.json'
 # Optional private-repository credentials staged by colab_runner.launch().
 GIT_AUTH = 'mlbridge_git_auth'
 GIT_ASKPASS = 'mlbridge_git_askpass.sh'
-# 心跳：RUNNING/PUBLISHING 期间周期性刷新本地状态文件（有界间隔）。
-# 心跳不能阻止 VM 消失（/content 仍可能整体丢失）；它的价值是本地把
-# “最后看到”与“当前”区分开（配合本地 last-known 记录）。
+# RUNNING/PUBLISHING 阶段定期写入心跳。
 HEARTBEAT_INTERVAL = 300  # 秒；有界
 HEARTBEAT_PHASES = frozenset({'RUNNING', 'PUBLISHING'})
 
-# 状态文件只有一个写入契约：串行化读-改-写 + 原子替换，避免主线程终态
-# 与心跳线程互相覆盖字段（2026-10-19 双 A100 实例丢失事故的教训之一）。
+# 串行化读改写并原子替换状态文件，避免心跳覆盖终态。
 _WRITE_LOCK = threading.Lock()
 
 
@@ -160,9 +157,7 @@ def main():
         if not shutil.which('git'):
             run(['apt-get', 'update', '-qq'])
             run(['apt-get', 'install', '-y', '-qq', 'git'])
-        # GitHub must contain the pinned commit. Private repositories are
-        # cloned with a short-lived GIT_ASKPASS credential file (see
-        # clone_repository); public repositories behave exactly as before.
+        # 私有仓库克隆使用临时 GIT_ASKPASS 凭据（见 clone_repository）。
         clone_repository(plan['repository'], plan['commit'], root)
         missing = [x for x in ('restic', 'rclone') if not shutil.which(x)]
         if missing:

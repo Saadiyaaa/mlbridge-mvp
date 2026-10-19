@@ -1,38 +1,14 @@
-"""Short-lived SSH observation channel for MLBridge jobs (observation only).
+"""对已有 Colab 会话发起一次性 SSH 系统观测或自定义命令。
 
-``ssh_observe`` 让 Agent 轮询 GPU / 系统 / 进程 / 输出 / 日志大小 / worker
-阶段：每次观察都重新用 SSH 连一次既有 runtime，事后立即断开。它本身
-不创建、不停止、不改变任何 Colab runtime —— 观察失败绝不等于任务失败。
+从 colab-cli 会话存储选择目标 session，并在 0700 临时目录中创建仅包含
+该会话的 0600 存储供 ProxyCommand 使用；目录在请求结束后删除。
+连接时指定 ``-s NAME``，不使用 ``--rm``，不创建或停止实例；此行为依赖
+google-colab-cli 0.7.4 的会话解析机制。连接失败不代表 Worker 失败。
 
-机制
-----
-1. 从既有的 colab-cli 会话存储（默认 ``~/.config/colab-cli/sessions.json``，
-   可被环境变量 ``MLBRIDGE_COLAB_SESSIONS`` 重定向到绝对路径，测试用）中
-   取用户指名的 session。目标 session 不存在时，在发起任何连接之前就拒绝。
-2. 在 0700 临时目录里构造一个 0600 的隔离 sessions.json，只写入选中
-   session 的整个条目（含 token）。无论成功失败都随临时目录删除；token
-   永不打印，错误信息中也绝不包含存储内容。
-3. 用 OpenSSH 发起一次性命令；ProxyCommand 指名隔离存储内已存在的
-   session。colab-cli 0.7.4 在 _session_exists 为真时不会新建实例；
-   若会话已终止，get_session 返回失败。不能用不带 -s 的代理调用，
-   因为 CLI 的单会话选择提示会写入 stdout、破坏 SSH 字节流。
-
-安全边界（有意为之的设计，勿"顺手加固"）
-----------------------------------------
-* 绝不调用 ``colab new``，只在隔离存储中已有目标会话时传 ``-s NAME``；
-  不对不存在的会话连接，绝不传 ``--rm``（会在断开时杀掉 runtime）。
-  这一保护依赖已核对的 google-colab-cli 0.7.4 的会话解析行为。
-* SSH 身份：优先使用既有的 MLBridge 专用密钥（配置目录 ssh/id_ed25519），
-  否则使用 ``~/.ssh/id_ed25519`` 或 ``id_ecdsa``（或用参数 ``identity``
-  显式指定路径）。绝不生成密钥；colab 代理握手
-  （``--identity``）与 ssh（``-i``）使用同一把私钥。
-* Host key 策略：使用临时 known_hosts 与 ``accept-new``；不建立跨调用的
-  持久 host-key 信任，不能等同于服务器身份的端到端验证。代理 WebSocket
-  仍依赖 colab-cli 的 TLS、会话 token 和公钥；勿向未信任的实例执行命令。
-* 远程命令：默认快照只输出 GPU / CPU / 内存 / 磁盘 / 进程摘要，输出与
-  日志只报大小和修改时间，不打印凭据、环境变量、命令参数或日志内容。
-  自定义命令经 ``shlex.join`` 生成
-  POSIX 安全引用后整体发给远端 shell —— 调用方被视作已显式授权远程执行。
+使用已有 SSH 私钥，不自动生成；Host key 使用临时 known_hosts 与
+``accept-new``，不保留跨请求的主机身份记录，无法提供持续的主机身份验证。
+默认快照只输出系统指标
+和文件大小，不读取项目日志正文；自定义命令以远端 root 权限执行。
 """
 from __future__ import annotations
 
@@ -147,7 +123,7 @@ def sessions_store_path() -> Path:
 
 
 def locate_identity(identity: str | None = None) -> Path:
-    """找到既有兼容私钥；绝不生成、绝不满意于缺失。"""
+    """找到已有的兼容私钥；未找到则拒绝连接。"""
     candidates = ([Path(identity).expanduser()] if identity else
                   [config_dir() / 'ssh' / 'id_ed25519',
                    *[Path.home() / '.ssh' / key for key in _DEFAULT_IDENTITY_KEYS]])
@@ -273,7 +249,7 @@ def ssh_observe(session: str, command: list[str] | None = None, *,
                 f'SSH 观察超时（预算 {timeout}s）：连接或远端命令过慢') from exc
         except FileNotFoundError as exc:
             raise BridgeError('找不到 OpenSSH 客户端 ssh') from exc
-        # 临时目录（含含 token 的隔离存储）在此 ALWAYS 销毁，成功失败皆然。
+        # 请求结束时清理包含 session token 的临时存储。
     if done.returncode != 0:
         # 不拼接远端 stderr：它可能包含原项目输出或敏感内容。
         raise BridgeError(f'SSH 观察失败(exit {done.returncode})；请确认实例仍在运行、'

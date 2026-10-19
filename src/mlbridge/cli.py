@@ -30,7 +30,7 @@ def parser() -> argparse.ArgumentParser:
     x.add_argument('project'); x.add_argument('--label', required=True)
     x.add_argument('--path', action='append', required=True, dest='paths')
     x.add_argument('--no-materialize-links', action='store_true',
-                   help='保留旧路径校验：不物化显式选中的软链接（外部链接将拒绝）')
+                   help='不物化显式选中的软链接（外部链接将被拒绝）')
     x = sub.add_parser('artifacts', help='列出项目快照及其标签')
     x.add_argument('project')
     x = sub.add_parser('fetch', help='按 snapshot ID 恢复相对路径，不同步代码')

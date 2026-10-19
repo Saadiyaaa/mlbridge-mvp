@@ -256,7 +256,7 @@ def test_default_high_mem_from_global_settings(tmp_path, monkeypatch):
     path = core.config_dir() / 'settings.toml'
     path.parent.mkdir()
     path.write_text('[storage]\nremote="drive"\n')
-    assert core.default_high_mem() is False  # older settings remain compatible
+    assert core.default_high_mem() is False  # 未配置时使用普通内存机型
     path.write_text('[colab]\nhigh_mem=true\n')
     assert core.default_high_mem() is True
     path.write_text('[colab]\nhigh_mem="true"\n')
@@ -397,8 +397,8 @@ def test_git_preflight_fails_when_repository_cannot_be_proven(tmp_path, monkeypa
         core.git_commit(root, False, repository='https://github.com/demo/demo.git')
 
 
-def test_git_preflight_without_repository_keeps_old_call_shape(tmp_path, monkeypatch):
-    """colab_runner.launch 的旧调用 git_commit(root, allow_dirty) 仍兼容。"""
+def test_git_preflight_without_repository_checks_upstream(tmp_path, monkeypatch):
+    """不传 repository 时只检查当前分支的上游。"""
     root = _git_root(tmp_path)
     def fake(cmd, **kwargs):
         return _happy_git(cmd)

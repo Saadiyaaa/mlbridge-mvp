@@ -515,9 +515,7 @@ def test_check_single_active_empty_other_and_own():
     # 已有 1 个他人实例：达到上限，拒绝
     with pytest.raises(core.BridgeError, match='单实例策略拒绝分配'):
         colab_runner.check_single_active('new', 1, ['existing'])
-    # 复用已在服务器上活跃的 session 名一律 fail-closed 拒绝（安全底线），
-    # 即使 limit 显式为 0 也不例外：这是分配失败竟底 stop 不误杀生产实例
-    # 的前提。
+    # 活跃 session 不可复用；limit=0 只关闭数量上限。
     with pytest.raises(core.BridgeError, match='已在 colab 服务器上活跃'):
         colab_runner.check_single_active('existing', 1, ['existing'])
     with pytest.raises(core.BridgeError, match='已在 colab 服务器上活跃'):
@@ -608,8 +606,7 @@ def test_launch_max_active_sessions_zero_skips_limit_count(tmp_path, monkeypatch
 
 
 def test_launch_disabled_limit_still_refuses_own_active_session(tmp_path, monkeypatch):
-    """limit=0 时复用活跃 --session 仍 fail-closed：不 new、不 stop、
-    不写本地记录；分配失败竟底 stop 绝不可能命中预先存在的实例。"""
+    """limit=0 时复用活跃 session 仍拒绝分配、停止和写本地记录。"""
     _prepare_project(tmp_path, monkeypatch)
     calls = []
     monkeypatch.setattr(colab_runner, 'list_active_sessions', lambda: ['mlb-own-0001'])

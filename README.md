@@ -2,7 +2,7 @@
 
 **面向 Git 机器学习项目的无侵入数据快照与 Google Colab 远程调度桥梁。**
 
-MLBridge 在不修改研究项目源码、不写入项目内配置文件、不引入任何 SDK 依赖的前提下，实现本地代码仓库与云端计算资源的解耦协作。系统通过 Git 固化代码版本，通过 restic 与 rclone 管理云端不可变数据快照，并利用官方 `google-colab-cli` 调度云端 GPU 实例完成任务与产物归档。
+MLBridge 通过 Git 固定代码版本，以 restic 和 rclone 管理数据快照，并通过 `google-colab-cli` 调度 Colab 实例执行任务、归档产物。配置与状态存放在研究项目目录之外，无需修改项目源码或引入 SDK。
 
 ---
 
@@ -35,10 +35,10 @@ MLBridge 采用代码轨与数据轨分离的双轨控制架构：
 
 ## 存储与系统物理边界
 
-MLBridge 严格遵循系统分层与隔离原则，所有配置与状态均独立于研究项目目录：
+配置与状态存放在研究项目目录之外：
 
 ```text
-研究项目工作区（无任何侵入）           用户级全局配置（XDG 规范）
+研究项目工作区                       用户级全局配置（XDG）
 /path/to/project/                     ~/.config/mlbridge/
 ├── train.py                          ├── settings.toml        (模式 0600)
 ├── data/                             ├── restic-password      (模式 0600)
@@ -132,7 +132,7 @@ mlbridge publish image-project --label raw-v1 --path data/raw
 {"project": "image-project", "label": "raw-v1", "snapshot_id": "a48f93bc21e78491029c782138a0f98d78120491823091248102938102938102"}
 ```
 
-**外部软链接输入（默认）**：若 `--path` 明确指向软链接，例如 `models/stable-diffusion/stable-diffusion-x4-upscaler` 指向工作区外的模型，`publish` 会在工作区**外**暂存真实文件，按原项目相对路径生成**同一个快照**；Colab 恢复后得到真实文件夹，无须原机器的绝对路径。可同时指定普通路径，仍只生成一个快照。不会改写项目文件或原软链接。启用物化暂存时，目录内部的其他软链接、特殊文件、重复或父子重叠路径会报错，暂存树不包含 `.git` 元数据；任何模式下经过软链接祖先的路径会报错（应直接选链接本身）。普通路径不启用暂存；若其目录内部含链接，默认报错并提示单独 `--path` 选择，否则会把失效链接当成有效输入。`--no-materialize-links` 可恢复旧行为。若要使用旧校验行为，传 `--no-materialize-links`（越界软链接会被拒绝）。暂存优先硬链接；跨设备/不支持时会复制，可能需要与模型大小相当的临时空间；源文件发布期间应保持不变。首次上传模型与 Colab 恢复仍可能传输数 GB。
+**外部软链接输入（默认）**：若 `--path` 明确指向软链接，例如指向工作区外模型的 `models/stable-diffusion/stable-diffusion-x4-upscaler`，`publish` 会在工作区外暂存真实文件，按项目相对路径生成快照；Colab 恢复后得到真实文件夹。可同时指定普通路径，所有选中路径只生成一个快照；项目文件和原软链接保持不变。物化暂存拒绝目录内部的软链接、特殊文件、重复或父子重叠路径，并排除 `.git` 元数据。任何模式下都拒绝经过软链接祖先的路径（应直接选择链接本身）。普通路径不启用暂存，其目录内部若含链接则默认报错。`--no-materialize-links` 禁用物化，显式选中的越界软链接也会被拒绝。暂存优先使用硬链接；跨设备或不支持硬链接时会复制，可能需要与模型大小相当的临时空间。发布期间源文件应保持不变；首次上传和恢复仍可能传输数 GB。
 
 ```bash
 mlbridge publish image-project --label models-and-input \
@@ -152,11 +152,11 @@ mlbridge run image-project --job upstream --input a48f93bc21e78491029c782138a0f9
 
 使用 `run --detach` 后须继续执行 `mlbridge watch <session>`（或手动 `mlbridge stop <session>`）；远端 Worker 不主动关停实例。若无人接管，实例可能持续计费。`watch --no-stop` 会保留成功实例，需自行关停。
 
-**单实例分配守卫（默认开启，上限 1）**：`run` 在 `colab new` 之前会以 `colab sessions`（服务器权威）核对当前活跃实例数；已有其他活跃 session 时拒绝分配，不重试、不停止任何实例、不留本地任务记录。CLI 失败、超时或输出格式无法识别一律视为拒绝（fail-closed），请手动运行 `colab sessions` 确认后再重试。上限取自 `settings.toml` 的 `[colab].max_active_sessions`（缺省 `1`；`0` 只关闭并发上限检查），也可在每次提交时用 `--max-active-sessions <n>` 显式指定。**无论上限如何（包括 0），复用指向已活跃实例的 `--session` 名都会 fail-closed 拒绝**：这是安全底线——否则该复用请求在 `colab new` 失败路径上的兜底停止可能误杀正在生产的实例。已知局限：守卫查询与 `colab new` 之间存在 TOCTOU 竞态；本地 flock（状态目录 `launch.lock`，以及逐任务的 `<session>.lock`）只串行化同一台机器上 MLBridge 自身的并发操作，无法约束其他工具或用户直接调用 `colab new`/`colab stop`。守卫只阻止新分配；它不能恢复已消失的实例或其中 `/content` 的数据。
+**实例分配守卫（默认上限 1）**：`run` 在 `colab new` 前通过 `colab sessions` 查询活跃实例；达到上限时拒绝分配。查询失败、超时或输出格式无法识别时也拒绝分配，请手动运行 `colab sessions` 确认后重试。上限取自 `settings.toml` 的 `[colab].max_active_sessions`（缺省 `1`；`0` 关闭并发上限检查），也可用 `--max-active-sessions <n>` 指定。无论上限如何，`--session` 名若已对应活跃实例都会被拒绝，避免分配失败时的回收操作停止该实例。守卫查询与分配之间存在竞态；本地锁（状态目录 `launch.lock` 和逐任务的 `<session>.lock`）只协调同机 MLBridge 进程，不约束其他工具或用户。守卫不恢复已消失实例及其 `/content` 数据。
 
-**心跳与本地 last-known 状态**：远端 Worker 在 RUNNING/PUBLISHING 阶段以有界间隔（默认 300 秒）刷新 `/content/mlbridge_state.json` 的 `heartbeat` 时间戳（线程锁串行化所有状态写入，终态不会被心跳覆盖）。VM 消失时 `/content` 不可恢复；本地 `watch` 会把每次观测写入任务记录的 `last_known`，`mlbridge status <session>` 在远端不可达时仍报告 `UNREACHABLE`（绝不误报 FAILED）并附带 `last_known`，供判断“消失前在干什么”。终态（SUCCEEDED/FAILED 及 error/snapshot_id）会另存到本地状态目录 `diagnostics/<session>.json`（0600），这是“远端断开前自报了什么”的记录，不构成对远端成功或数据完整的独立证明；独立验证请用 `mlbridge artifacts` 核对 restic 快照。诊断文件只存本地，不上传存储、不含凭据；若需异地保存请自行处理，不要在日志中记录凭据。
+**心跳与本地状态**：远端 Worker 在 RUNNING/PUBLISHING 阶段按默认 300 秒的间隔刷新 `/content/mlbridge_state.json` 的 `heartbeat` 时间戳；状态写入由线程锁串行化。`watch` 将观测结果写入本地任务记录的 `last_known`；远端不可达时，`mlbridge status <session>` 报告 `UNREACHABLE` 并附带最后一次已知状态。终态（SUCCEEDED/FAILED 及 error/snapshot_id）另存到本地 `diagnostics/<session>.json`（0600）。诊断文件记录远端上报结果，不验证输出数据完整性；可用 `mlbridge artifacts` 核对 restic 快照。VM 消失后 `/content` 不可恢复。诊断文件不上传、不含凭据；如需异地保存请自行处理，勿在日志中记录凭据。
 
-**私有 GitHub 仓库**：`repository` 与 Git remote 均保持不带凭据的 `https://github.com/<owner>/<repo>.git`。本地默认读取 `~/.config/zsh/private/secrets.env` 中的 `MLBRIDGE_GITHUB_USERNAME=...`（GitHub 用户名）和 `MLBRIDGE_GITHUB_TOKEN=...`（有该仓库 Contents 读取权限的 fine-grained PAT）；也可为本次进程同时设置两个同名环境变量，覆盖文件中的值。不必把这两个变量先 `export` 到 shell 环境。文件须属于当前用户、是普通文件且权限不高于 `0600`；解析使用 `awk` 提取两条简单赋值（可带 `export` 或整值单/双引号），**不会 source/eval 文件**，不展开 `$VAR` 或命令替换。两个来源不会拼接，只提供用户名或只提供 token 会在创建实例前报错；都没有时走公开仓库路径。不要把 token 写入项目配置、命令参数、远端 URL、脚本或提交到 Git。MLBridge 将 token 放进权限 0600 的临时文件，通过 Colab 上传，克隆时由 `GIT_ASKPASS` 读取，克隆成功或失败后立即清理；不会传给 MyPure 的 `setup`/`command` 环境。文件中的令牌只在需要 `run` 时读取，不会由 `publish`/`doctor` 读取；若本机该文件默认可用，运行公开仓库任务也会上传此令牌，建议仅在信任的作业环境使用该默认文件。Colab 远端属于可执行项目代码的同一 OS 用户，上传至克隆期间和控制通道异常时不能承诺绝对隔离或可靠擦除；本地进程被强制杀死也可能留下权限为 0600 的临时凭据文件，须在本地临时目录检查并删除；请使用最小授权、限定仓库的可撤销 token。SSH URL、其他 Git 服务及 Git LFS/submodule 的二次鉴权不在此通道内。Git 预检仍要求本地仓库有匹配 URL 的 upstream、HEAD 已推送且已跟踪文件干净；不要把 `--allow-dirty` 当作正常流程。
+**私有 GitHub 仓库**：`repository` 与 Git remote 均保持不带凭据的 `https://github.com/<owner>/<repo>.git`。本地默认读取 `~/.config/zsh/private/secrets.env` 中的 `MLBRIDGE_GITHUB_USERNAME=...`（GitHub 用户名）和 `MLBRIDGE_GITHUB_TOKEN=...`（有该仓库 Contents 读取权限的 fine-grained PAT）；也可为本次进程同时设置两个同名环境变量，覆盖文件中的值。不必把这两个变量先 `export` 到 shell 环境。文件须属于当前用户、是普通文件且权限不高于 `0600`；解析使用 `awk` 提取两条简单赋值（可带 `export` 或整值单/双引号），**不会 source/eval 文件**，不展开 `$VAR` 或命令替换。两个来源不会拼接，只提供用户名或只提供 token 会在创建实例前报错；都没有时走公开仓库路径。不要把 token 写入项目配置、命令参数、远端 URL、脚本或提交到 Git。MLBridge 将 token 放进权限 0600 的临时文件，通过 Colab 上传，克隆时由 `GIT_ASKPASS` 读取，克隆成功或失败后立即清理；不会传给研究任务的 `setup`/`command` 环境。文件中的令牌只在需要 `run` 时读取，不会由 `publish`/`doctor` 读取；若本机该文件默认可用，运行公开仓库任务也会上传此令牌，建议仅在信任的作业环境使用该默认文件。Colab 远端属于可执行项目代码的同一 OS 用户，上传至克隆期间和控制通道异常时不能承诺绝对隔离或可靠擦除；本地进程被强制杀死也可能留下权限为 0600 的临时凭据文件，须在本地临时目录检查并删除；请使用最小授权、限定仓库的可撤销 token。SSH URL、其他 Git 服务及 Git LFS/submodule 的二次鉴权不在此通道内。Git 预检仍要求本地仓库有匹配 URL 的 upstream、HEAD 已推送且已跟踪文件干净；不要把 `--allow-dirty` 当作正常流程。
 
 ### 6. 拉取输出产物
 ```bash

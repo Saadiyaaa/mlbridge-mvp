@@ -141,11 +141,7 @@ def test_worker_ubuntu_restic_0164_without_overwrite_flag(tmp_path, monkeypatch)
 
 
 def test_worker_legacy_restic_without_overwrite_flag(tmp_path, monkeypatch):
-    """restic 0.12.x(如 Ubuntu 22.04/Colab apt):不传 --overwrite 也能完成任务。
-
-    旧实现无条件传 --overwrite never,在旧版 restic 上是 unknown-flag 直接失败;
-    现在按版本自适应,不再传参,语义(无条件覆盖)与旧版缺省行为一致。
-    """
+    """restic 0.12.x 不支持 --overwrite；使用默认覆盖行为完成任务。"""
     result = _run_worker(tmp_path, monkeypatch, '0.12.1')
     assert result['state']['phase'] == 'SUCCEEDED'
     assert (result['ws'] / 'outputs' / 'img.png').read_bytes() == b'SNAPSHOT'

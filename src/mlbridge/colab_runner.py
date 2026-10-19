@@ -26,11 +26,7 @@ from .core import (BridgeError, default_gpu, default_high_mem,
 FINAL = {'SUCCEEDED', 'FAILED'}
 SESSION = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$')
 
-# 有界 colab 调用：kernel 通道 (exec/upload) 可能因 Colab 端故障无限阻塞
-# （2026-10-19 smoke-aspl-sd15 staging 实测 exec >8 分钟无返回，最终
-# "Connection was lost"）。因此所有 colab 子进程必须有超时；重试只针对
-# 幂等操作（重传同名文件 / 重复 exec 同一脚本 / 重复 stop），绝不重复
-# `colab new`——分配失败时不重试，避免复制计费实例。
+# colab 子进程调用有超时；仅对幂等操作重试，不重试实例分配。
 EXEC_TIMEOUT = 300      # 单次 exec：staging 脚本均微小，正常 <10s
 UPLOAD_TIMEOUT = 300    # 单次 upload：staging 文件均为 KB 级
 ALLOC_TIMEOUT = 900     # new：A100 分配可能排队，但仍须有界
@@ -155,14 +151,9 @@ def list_active_sessions() -> list[str]:
 
 
 def check_single_active(own: str, limit: int, active: list[str] | None = None) -> list[str]:
-    """单实例分配守卫（fail-closed）：不做任何清理动作，只抛错拒绝。
+    """在分配前拒绝复用活跃 session，并按 limit 检查其他活跃实例数。
 
-    两道检查，均在 `colab new` 之前执行：
-    1. own 已活跃 ⇒ 复用活跃 session 一律拒绝。这是安全底线，即使
-       limit=0（显式关闭并发上限检查）也必须执行：否则 --session 复用
-       一个正在生产的实例后，`colab new` 失败路径上的兜底 stop 会有
-       误杀真实任务的风险。拒绝优先于一切（包括不写本地记录）。
-    2. limit>0 时按他人（own 以外）实例数核对上限。
+    limit=0 只关闭数量上限；复用活跃 session 仍可能使失败回收停止现有实例。
     """
     fetched = list_active_sessions() if active is None else active
     if own in fetched:
@@ -271,11 +262,9 @@ def diagnostic_path(session: str) -> Path:
 
 
 def save_terminal_diagnostic(session: str, status: dict) -> bool:
-    """把远端自报的终态（SUCCEEDED/FAILED 及 error/snapshot_id）另存本地。
+    """本地保存远端上报的终态（0600）；失败时静默放弃。
 
-    这是“远端在断开前自报了什么”的记录，不是本地对远端成功或数据完整
-    的独立证明；独立验证请用 `mlbridge artifacts` 核对 restic snapshot。
-    仅本地落盘（0600），不上传存储、不写任何凭据。失败时静默放弃。
+    记录不包含凭据，也不验证输出快照完整性。
     """
     if not SESSION.fullmatch(session):
         return False
@@ -476,15 +465,10 @@ def stage(session: str, src: Path, remote_basename: str):
 
 
 def _staging_failed(session: str, starter_sent: bool) -> None:
-    """staging 失败后的安全回收：绝不重复分配，也绝不误杀可能的 worker。
+    """处理 staging 失败：starter 前尝试清理并停止，starter 后保留实例。
 
-    starter 脚本之前失败 ⇒ worker 一定未启动（此前只上传文件），可以安全地
-    清理凭据并自动停止。starter 阶段失败 ⇒ exec 回复丢失但内核可能已执行，
-    worker 或已启动：先有界探测状态文件；只有确认 worker 正在运行（正面
-    阶段）或传输完全不可达/未知时，都一律保留实例——传输未知绝不等于
-    worker 未启动，此时清理或 stop 都可能误杀活任务。保留期间在本地记录
-    staging_failed / staging_probe_phase，并打印可操作的 watch/status 与
-    手动停止提示，由用户确认后自行处理。
+    starter 的 exec 回复丢失时 Worker 可能已经启动；记录探测结果，
+    由用户确认后接管或停止实例。
     """
     try:
         with _job_lock(session):
@@ -573,12 +557,8 @@ def launch(name: str, job: str, inputs: list[str], gpu: str | None = None,
         request.extend(('--gpu', gpu_norm))
     if use_high_mem:
         request.append('--high-mem')
-    # 先写本地记录再分配：即使 new 本身挂死/失败，也存在可 stop/审计的记录。
-    # 守卫在 `colab new` 之前执行，且无论 limit 是否为 0 都会查询一次活跃
-    # 列表：只有证明 own 当前不在活跃列表里，后续分配失败时才敢安全清理，
-    # 复用活跃 session 一律 fail-closed 拒绝（不分配、不记录、不清
-    # 理、不 stop 任何实例）。检查与分配在跨进程 flock 内串行，收敛同机
-    # 并发窗口。
+    # 先查询活跃实例并拒绝复用，再写本地记录、分配实例；锁内串行化同机提交。
+    # 记录可用于分配失败后的排查和停止操作。
     limit = (default_max_active_sessions() if max_active_sessions is None
              else max_active_sessions)
     if max_active_sessions is not None and max_active_sessions < 0:
@@ -590,11 +570,8 @@ def launch(name: str, job: str, inputs: list[str], gpu: str | None = None,
         try:
             cli(*request, timeout=ALLOC_TIMEOUT)
         except BridgeError:
-            # 分配失败绝不重试 new（避免复制计费实例）；若实例实际已创建，
-            # stop 是幂等的，最坏情况只是对不存在的 session 空跑一次。
-            # 能走到这里的只会是“守卫时已确认未活跃”的全新 session：
-            # 复用活跃实例的请求在上面已被拒绝，兜底 stop 永远不可能
-            # 命中预先存在的生产实例。
+            # 分配失败不重试 new；对已确认未活跃的 session 尝试停止。
+            # 查询与分配之间仍可能发生外部并发变更。
             try:
                 shutdown(session)
             except BridgeError:
@@ -617,14 +594,12 @@ def launch(name: str, job: str, inputs: list[str], gpu: str | None = None,
             stage(session, expand(store['password_file']), 'mlbridge_restic_password')
             if gh_auth:
                 # 私有仓库凭据最后上传;上传后立刻在 VM 上收紧权限并生成 askpass。
-                # 窗口期内凭据仅对同一 OS 用户可读(见 README/安全说明)。
+                # 上传到克隆之间，同一 OS 用户可读取凭据（见 README）。
                 _stage_github_auth(session, *gh_auth)
             starter_sent = True
             exec_starter_once(session, starter_script())
     except Exception:
-        # 安全回收：仅 pre-starter 失败会自动停止；starter 之后的不确定性
-        # 一律保留实例（传输未知 ≠ worker 未启动），详见 _staging_failed。
-        # 绝不重复 colab new。错误原样上抛。
+        # starter 前失败尝试停止；starter 后失败保留实例供检查。
         _staging_failed(session, starter_sent)
         raise
     return session

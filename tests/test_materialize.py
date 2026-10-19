@@ -84,8 +84,8 @@ def test_file_and_dir_symlink_materialized(ws):
     assert not stage.exists()
 
 
-def test_legacy_validation_rejects_external_symlink(ws):
-    # 显式 --no-materialize-links 下旧路径校验仍拒绝外部软链接。
+def test_validation_without_materialization_rejects_external_symlink(ws):
+    # 禁用物化时，越界软链接被拒绝。
     (ws / 'w.bin').symlink_to('../external/weights.bin')
     with pytest.raises(core.BridgeError):
         core.validate_paths(ws, ['w.bin'])

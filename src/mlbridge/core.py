@@ -82,7 +82,7 @@ def _colab_settings() -> dict[str, Any]:
 
 
 def default_gpu() -> str:
-    """Read the global Colab default; older settings without [colab] use L4."""
+    """读取 Colab GPU 默认值；未配置时使用 L4。"""
     gpu = _colab_settings().get("default_gpu", "L4")
     if not isinstance(gpu, str) or gpu.upper() not in GPU_CHOICES:
         raise BridgeError("settings.toml 的 colab.default_gpu 无效；支持 T4, L4, A100, H100, G4, CPU (或 NONE)")
@@ -90,7 +90,7 @@ def default_gpu() -> str:
 
 
 def default_high_mem() -> bool:
-    """Older settings without high_mem keep the normal-memory machine shape."""
+    """读取高内存机型配置；未配置时使用普通机型。"""
     high_mem = _colab_settings().get("high_mem", False)
     if not isinstance(high_mem, bool):
         raise BridgeError("settings.toml 的 colab.high_mem 必须为 true 或 false")
@@ -98,12 +98,9 @@ def default_high_mem() -> bool:
 
 
 def default_max_active_sessions() -> int:
-    """单实例守卫的默认上限；旧配置缺省为 1（保守策略）。
+    """读取实例数上限（默认 1）；0 关闭并发上限检查。
 
-    0 表示显式关闭并发上限检查（例如多实例由用户自行管理）；即使为 0，
-    复用已在 colab 活跃的 --session 名仍会被 fail-closed 拒绝（安全底线，
-    见 colab_runner.check_single_active）。负数与非法
-    类型一律拒绝，绝不静默放宽。
+    复用活跃的 --session 名仍由 colab_runner.check_single_active 拒绝。
     """
     value = _colab_settings().get("max_active_sessions", 1)
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -117,9 +114,7 @@ def expand(v: str) -> Path:
 
 
 def repo_url(name: str, store: dict[str, str]) -> str:
-    # 云端 remote（如 gdrive）用相对 prefix；local 类 remote 允许绝对路径。
-    # 原实现无条件 strip("/")，会把绝对路径变成相对路径，导致 local 后端
-    # 在当前工作目录下开新位置。
+    # 云端 remote（如 gdrive）用相对 prefix；local 类 remote 保留绝对路径。
     raw = store["prefix"].strip()
     parts = [p for p in raw.split("/") if p]
     if not parts or any(p in ("..", ".") for p in parts):
@@ -362,11 +357,7 @@ def check_git_pushed(root: Path, repository: str | None = None) -> None:
 
 
 def git_commit(root: Path, allow_dirty: bool, repository: str | None = None) -> str:
-    """repository 传项目配置的 repo URL 时，同时校验上游即该仓库。
-
-    保持前两个位置参数不变：旧调用 git_commit(root, allow_dirty) 仍有效，
-    只是不做 repository 一致性校验；launch 处应传入 cfg['repository']。
-    """
+    """返回当前 commit；提供 repository 时同时校验上游仓库。"""
     if not root.is_dir():
         raise BridgeError(f"项目目录不存在: {root}")
     if not allow_dirty:
