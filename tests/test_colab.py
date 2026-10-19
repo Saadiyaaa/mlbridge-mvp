@@ -1,4 +1,5 @@
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -347,15 +348,14 @@ def test_staging_failure_after_starter_keeps_running_worker(tmp_path, monkeypatc
     _prepare_project(tmp_path, monkeypatch)
     seen = []
 
-    def fake_put(session, code):
-        if 'start_new_session' in code:
-            seen.append(session)
-            raise core.BridgeError('exec lost')
+    def fake_starter(session, contents):
+        seen.append(session)
+        raise core.BridgeError('exec lost')
 
     monkeypatch.setattr(colab_runner, 'cli',
                         lambda *a, **k: subprocess.CompletedProcess(a, 0))
     monkeypatch.setattr(colab_runner, 'stage', lambda *a: None)
-    monkeypatch.setattr(colab_runner, 'put_script', fake_put)
+    monkeypatch.setattr(colab_runner, 'exec_starter_once', fake_starter)
     monkeypatch.setattr(colab_runner, 'get_status',
                         lambda s: {'phase': 'RUNNING'})
     monkeypatch.setattr(colab_runner, 'shutdown',
@@ -366,3 +366,95 @@ def test_staging_failure_after_starter_keeps_running_worker(tmp_path, monkeypatc
     assert len(seen) == 1
     record = colab_runner.get_local(seen[0])
     assert record['staging_failed'] is True and record['stopped'] is False
+
+
+def _fake_launch_cli(monkeypatch, status):
+    """launch 全流程打桩：starter exec 丢失一次回复后抛错，且不重试。
+
+    返回 (exec_bodies, captured_session, stops)。exec_bodies 是每次 exec
+    的脚本内容；cleanup 凭据删除脚本含 os.remove 可据此识别。
+    """
+    exec_bodies, captured, stops = [], [], []
+
+    def fake_cli(*args, capture=False, timeout=None):
+        if args[0] == 'exec':
+            contents = Path(args[args.index('-f') + 1]).read_text()
+            exec_bodies.append(contents)
+            if 'start_new_session' in contents:
+                raise core.BridgeError('exec lost')
+        return subprocess.CompletedProcess(args, 0)
+
+    def fake_get_status(session):
+        captured.append(session)
+        return status
+
+    def fake_shutdown(session):
+        stops.append(session)
+
+    monkeypatch.setattr(colab_runner, 'cli', fake_cli)
+    monkeypatch.setattr(colab_runner, 'stage', lambda *a: None)
+    monkeypatch.setattr(colab_runner, 'get_status', fake_get_status)
+    monkeypatch.setattr(colab_runner, 'shutdown', fake_shutdown)
+    return exec_bodies, captured, stops
+
+
+def test_starter_reply_lost_status_unreachable_no_cleanup_no_stop(tmp_path,
+                                                                 monkeypatch):
+    """starter 回复丢失 + 状态 UNREACHABLE ⇒ 传输未知 ≠ worker 未启动：
+    不清理凭据、不停止实例，只留本地标记与可操作提示。"""
+    _prepare_project(tmp_path, monkeypatch)
+    exec_bodies, captured, stops = _fake_launch_cli(
+        monkeypatch, {'phase': 'UNREACHABLE', 'reason': 'connection lost'})
+    with pytest.raises(core.BridgeError, match='exec lost'):
+        colab_runner.launch('demo', 'example', [], 'L4', allow_empty_input=True)
+    assert len(captured) == 1
+    record = colab_runner.get_local(captured[0])
+    assert record['staging_failed'] is True
+    assert record['staging_probe_phase'] == 'UNREACHABLE'
+    assert record['stopped'] is False
+    assert stops == []
+    assert not any('os.remove' in body for body in exec_bodies)
+
+
+def test_starter_reply_lost_status_unknown_no_stop(tmp_path, monkeypatch):
+    """status 返回 {}（UNKNOWN）⇒ 同样绝不 stop、不清理。"""
+    _prepare_project(tmp_path, monkeypatch)
+    exec_bodies, captured, stops = _fake_launch_cli(monkeypatch, {})
+    with pytest.raises(core.BridgeError, match='exec lost'):
+        colab_runner.launch('demo', 'example', [], 'L4', allow_empty_input=True)
+    record = colab_runner.get_local(captured[0])
+    assert record['staging_failed'] is True
+    assert record['staging_probe_phase'] == 'UNKNOWN'
+    assert stops == []
+    assert not any('os.remove' in body for body in exec_bodies)
+
+
+def test_starter_exec_fails_exactly_once_no_duplicate_worker(tmp_path,
+                                                             monkeypatch):
+    """starter exec 失败后绝不重试：只调用一次 colab exec（Popen 不可
+    重试，重试会复制 worker）。幂等 prepare 脚本仍走有界重试路径。"""
+    _prepare_project(tmp_path, monkeypatch)
+    exec_bodies, captured, stops = _fake_launch_cli(
+        monkeypatch, {'phase': 'UNREACHABLE', 'reason': 'down'})
+    with pytest.raises(core.BridgeError, match='exec lost'):
+        colab_runner.launch('demo', 'example', [], 'L4', allow_empty_input=True)
+    assert sum('start_new_session' in body for body in exec_bodies) == 1
+    assert stops == []
+
+
+def test_exec_starter_once_never_retries(monkeypatch):
+    """exec_starter_once 直接调用 cli 一次（带界超时），不走 cli_retry。"""
+    calls, sleeps = [], []
+    monkeypatch.setattr(colab_runner.time, 'sleep', sleeps.append)
+
+    def fake_cli(*args, capture=False, timeout=None):
+        calls.append((args, timeout))
+        raise core.BridgeError('read timeout')
+
+    monkeypatch.setattr(colab_runner, 'cli', fake_cli)
+    with pytest.raises(core.BridgeError, match='read timeout'):
+        colab_runner.exec_starter_once('sess', colab_runner.starter_script())
+    assert len(calls) == 1
+    assert calls[0][0][:3] == ('exec', '-s', 'sess')
+    assert calls[0][1] == colab_runner.EXEC_TIMEOUT
+    assert sleeps == []  # 无退避 ⇒ 无重试

@@ -147,11 +147,25 @@ def starter_script() -> str:
 
 
 def put_script(session: str, contents: str):
+    """执行幂等脚本（prepare/askpass/cleanup/logs 等），允许有界重试。"""
     with tempfile.TemporaryDirectory(prefix='mlbridge-colab-') as t:
         p = Path(t) / 'script.py'
         p.write_text(contents)
-        # exec 是幂等的（脚本可安全重复执行），因此允许有界重试。
         cli_retry('exec', '-s', session, '-f', str(p), timeout=EXEC_TIMEOUT)
+
+
+def exec_starter_once(session: str, contents: str):
+    """执行 starter 脚本，且只执行一次（绝不重试）。
+
+    starter 内部运行 subprocess.Popen 启动 remote_worker，不是幂等操作：
+    若 exec 回复丢失后重试，会复制出第二个 worker。因此这里只调用一次
+    cli exec（带界超时）；失败时抛错，由调用方按不确定性回收（见
+    _staging_failed），绝不自动重发。
+    """
+    with tempfile.TemporaryDirectory(prefix='mlbridge-colab-') as t:
+        p = Path(t) / 'script.py'
+        p.write_text(contents)
+        cli('exec', '-s', session, '-f', str(p), timeout=EXEC_TIMEOUT)
 
 
 def cleanup_script() -> str:
@@ -279,12 +293,15 @@ def stage(session: str, src: Path, remote_basename: str):
 
 
 def _staging_failed(session: str, starter_sent: bool) -> None:
-    """staging 失败后的安全回收：绝不重复分配，也尽力不留计费实例。
+    """staging 失败后的安全回收：绝不重复分配，也绝不误杀可能的 worker。
 
-    starter 脚本之前失败 ⇒ worker 一定未启动（此前只上传文件），直接停止。
-    starter 阶段失败 ⇒ exec 回复丢失但内核可能已执行，worker 或已启动；
-    先有界探测状态文件，仅确认未运行时才停止。探测不可达时也按未启动处理
-    （此时任务仅启动数秒，重跑代价远低于闲置计费实例），并明确打印该决定。
+    starter 脚本之前失败 ⇒ worker 一定未启动（此前只上传文件），可以安全地
+    清理凭据并自动停止。starter 阶段失败 ⇒ exec 回复丢失但内核可能已执行，
+    worker 或已启动：先有界探测状态文件；只有确认 worker 正在运行（正面
+    阶段）或传输完全不可达/未知时，都一律保留实例——传输未知绝不等于
+    worker 未启动，此时清理或 stop 都可能误杀活任务。保留期间在本地记录
+    staging_failed / staging_probe_phase，并打印可操作的 watch/status 与
+    手动停止提示，由用户确认后自行处理。
     """
     try:
         record = get_local(session)
@@ -295,12 +312,25 @@ def _staging_failed(session: str, starter_sent: bool) -> None:
     if starter_sent:
         status = get_status(session)
         phase = status.get('phase', 'UNKNOWN')
+        try:
+            record = get_local(session)
+            record['staging_probe_phase'] = phase
+            store_local(session, record)
+        except BridgeError:
+            pass
         if phase in WORKER_PHASES:
             print(f'[mlbridge] 远端 worker 已启动 (phase={phase})；不停止实例。'
                   f'请用 mlbridge watch {session} 接管。', file=sys.stderr, flush=True)
             return
-        print(f'[mlbridge] 状态探测不可达 ({phase})；按 worker 未启动处理并停止实例。',
-              file=sys.stderr, flush=True)
+        # UNREACHABLE/UNKNOWN：传输未知 ≠ worker 未启动。starter 可能已在
+        # 回复丢失前 spawn 了 worker；此时清理凭据或 stop 都可能误杀活任务。
+        print(f'[mlbridge] 状态探测不可达 (phase={phase})；不把传输未知当作 '
+              'worker 未启动：starter 可能已在丢回复前启动 worker，'
+              '因此不清理凭据、不停止实例。', file=sys.stderr, flush=True)
+        print(f'[mlbridge] 请先观察: mlbridge watch {session} 或 '
+              f'mlbridge status {session}；确认任务确未运行后，再手动执行 '
+              f'mlbridge stop {session} 以免持续计费。', file=sys.stderr, flush=True)
+        return
     try:
         put_script(session, cleanup_script())
         print('[mlbridge] 已尽力删除 VM 上的临时凭据副本。', file=sys.stderr)
@@ -391,9 +421,10 @@ def launch(name: str, job: str, inputs: list[str], gpu: str | None = None,
                 # 窗口期内凭据仅对同一 OS 用户可读(见 README/安全说明)。
                 _stage_github_auth(session, *gh_auth)
             starter_sent = True
-            put_script(session, starter_script())
+            exec_starter_once(session, starter_script())
     except Exception:
-        # 安全回收：确认 worker 未运行时停止实例，避免留下计费的空闲 GPU；
+        # 安全回收：仅 pre-starter 失败会自动停止；starter 之后的不确定性
+        # 一律保留实例（传输未知 ≠ worker 未启动），详见 _staging_failed。
         # 绝不重复 colab new。错误原样上抛。
         _staging_failed(session, starter_sent)
         raise
