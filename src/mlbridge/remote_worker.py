@@ -16,6 +16,9 @@ from pathlib import Path
 BASE = Path('/content')
 STATE = BASE / 'mlbridge_state.json'
 PLAN = BASE / 'mlbridge_job.json'
+# Optional private-repository credentials staged by colab_runner.launch().
+GIT_AUTH = 'mlbridge_git_auth'
+GIT_ASKPASS = 'mlbridge_git_askpass.sh'
 
 
 def status(phase, **fields):
@@ -36,9 +39,42 @@ def run(args, *, cwd=None, env=None):
     subprocess.run(args, cwd=cwd, env=env, check=True)
 
 
-# restic < 0.16.2 没有 restore --overwrite；它恢复时本来就无条件覆盖。
+def _remove_git_auth():
+    """删除临时 GitHub 凭据与 askpass 脚本（仅在私有仓库克隆时存在）。"""
+    for name in (GIT_AUTH, GIT_ASKPASS):
+        (BASE / name).unlink(missing_ok=True)
+
+
+def clone_repository(repository: str, commit: str, root: Path):
+    """克隆并 checkout。token 绝不进入 argv、环境变量、remote URL 或日志。
+
+    私有仓库:凭据在 0600 文件里,由 GIT_ASKPASS 可执行脚本按提示读取;
+    GIT_TERMINAL_PROMPT=0 禁止任何交互式提示。克隆结束(无论成败)后
+    立即删除凭据文件与 askpass 脚本。公开仓库行为与之前完全一致。
+    """
+    auth, askpass = BASE / GIT_AUTH, BASE / GIT_ASKPASS
+    private = auth.is_file() and askpass.is_file()
+    try:
+        # GitHub must contain the pinned commit.
+        if root.exists():
+            shutil.rmtree(root, ignore_errors=True)
+        if private:
+            os.chmod(auth, 0o600)
+            env = dict(os.environ)
+            env['GIT_ASKPASS'] = str(askpass)
+            env['GIT_TERMINAL_PROMPT'] = '0'
+            run(['git', 'clone', '--no-checkout', repository, str(root)], env=env)
+        else:
+            run(['git', 'clone', '--no-checkout', repository, str(root)])
+        run(['git', 'checkout', commit], cwd=root)
+    finally:
+        if private:
+            _remove_git_auth()
+
+
+# restic < 0.17.0 没有 restore --overwrite；它恢复时缺省覆盖已有文件。
 # 老版本如果被传入该参数反而会报 unknown flag 而整 job 失败。
-_OVERWRITE_MIN = (0, 16, 2)
+_OVERWRITE_MIN = (0, 17, 0)
 
 
 def restore_args(mode: str = 'always') -> list[str]:
@@ -55,30 +91,35 @@ def restore_args(mode: str = 'always') -> list[str]:
 
 
 def main():
-    plan = json.loads(PLAN.read_text())
-    os.chmod(BASE / 'mlbridge_rclone.conf', 0o600)
-    os.chmod(BASE / 'mlbridge_restic_password', 0o600)
-    env = dict(os.environ)
-    env['RCLONE_CONFIG'] = str(BASE / 'mlbridge_rclone.conf')
-    env['RESTIC_PASSWORD_FILE'] = str(BASE / 'mlbridge_restic_password')
-    repo = plan['restic_repository']
-    root = BASE / 'mlbridge-workspace'
     try:
+        plan = json.loads(PLAN.read_text())
+        os.chmod(BASE / 'mlbridge_rclone.conf', 0o600)
+        os.chmod(BASE / 'mlbridge_restic_password', 0o600)
+        env = dict(os.environ)
+        env['RCLONE_CONFIG'] = str(BASE / 'mlbridge_rclone.conf')
+        env['RESTIC_PASSWORD_FILE'] = str(BASE / 'mlbridge_restic_password')
+        if (BASE / GIT_AUTH).exists():
+            os.chmod(BASE / GIT_AUTH, 0o600)
+        repo = plan['restic_repository']
+        root = BASE / 'mlbridge-workspace'
         status('PREPARING', job_id=plan['job_id'], session=plan['session'])
-        missing = [x for x in ['restic', 'rclone', 'git'] if not shutil.which(x)]
+        # Clone first so the short-lived GitHub token is removed before any
+        # potentially long restic/rclone installation or research setup.
+        if not shutil.which('git'):
+            run(['apt-get', 'update', '-qq'])
+            run(['apt-get', 'install', '-y', '-qq', 'git'])
+        # GitHub must contain the pinned commit. Private repositories are
+        # cloned with a short-lived GIT_ASKPASS credential file (see
+        # clone_repository); public repositories behave exactly as before.
+        clone_repository(plan['repository'], plan['commit'], root)
+        missing = [x for x in ('restic', 'rclone') if not shutil.which(x)]
         if missing:
             run(['apt-get', 'update', '-qq'])
             run(['apt-get', 'install', '-y', '-qq', *missing])
-        # GitHub must contain the pinned commit. Private repository auth is not
-        # automatically copied from the local machine in this first version.
-        if root.exists():
-            shutil.rmtree(root, ignore_errors=True)
-        run(['git', 'clone', '--no-checkout', plan['repository'], str(root)])
-        run(['git', 'checkout', plan['commit']], cwd=root)
         status('RESTORING')
         # 快照是输入数据的唯一契约：快照中与 git tracked 文件同路径的内容
         # 必须"快照优先"，而不是被 --overwrite never 静默跳过。
-        # restic ≥ 0.16.2 显式传 --overwrite always，老版本缺省即覆盖，语义一致。
+        # restic ≥ 0.17.0 显式传 --overwrite always，老版本缺省即覆盖，语义一致。
         for snapshot in plan['inputs']:
             run(['restic', '-r', repo, 'restore', snapshot,
                  '--target', str(root), *restore_args()], env=env)
@@ -108,15 +149,10 @@ def main():
                     result = item.get('snapshot_id', '')
             if not result:
                 raise RuntimeError('restic produced no final snapshot ID')
+        # 先把最终状态留在 VM 上供本地 watch 读取；只有 watch 确认读取后
+        # 才可按 auto_stop 选择释放实例，不能在这里主动 unassign。
         status('SUCCEEDED', elapsed_seconds=elapsed, snapshot_id=result,
                finished=datetime.now(timezone.utc).isoformat())
-        # 在真实 Colab 环境下，如果任务成功发布了产物，尝试调用官方 unassign 自动释放 VM，
-        # 避免用户在 --detach 模式下因本地失联或忘记关机而持续产生扣费账单。
-        try:
-            from google.colab import runtime
-            runtime.unassign()
-        except (ImportError, Exception):
-            pass
     except BaseException as exc:
         status('FAILED', error=f'{type(exc).__name__}: {exc}',
                finished=datetime.now(timezone.utc).isoformat())
@@ -126,6 +162,7 @@ def main():
         # originals are untouched.
         for name in ('mlbridge_rclone.conf', 'mlbridge_restic_password'):
             (BASE / name).unlink(missing_ok=True)
+        _remove_git_auth()
 
 
 if __name__ == '__main__':

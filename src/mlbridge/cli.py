@@ -9,9 +9,10 @@ from pathlib import Path
 
 from . import __version__
 from .colab_runner import get_local, get_status, launch, logs, shutdown, watch
+from .ssh_observe import ssh_observe
 from .core import (BridgeError, config_dir, expand, fetch, new_settings,
-                   project, publish, register, repo_url, restic, settings,
-                   restic_overwrite_supported)
+                   proc, project, publish, register, repo_url, restic,
+                   secret_env, settings, restic_overwrite_supported)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -28,6 +29,8 @@ def parser() -> argparse.ArgumentParser:
     x = sub.add_parser('publish', help='发布一组已完成的输入或输出目录')
     x.add_argument('project'); x.add_argument('--label', required=True)
     x.add_argument('--path', action='append', required=True, dest='paths')
+    x.add_argument('--no-materialize-links', action='store_true',
+                   help='保留旧路径校验：不物化显式选中的软链接（外部链接将拒绝）')
     x = sub.add_parser('artifacts', help='列出项目快照及其标签')
     x.add_argument('project')
     x = sub.add_parser('fetch', help='按 snapshot ID 恢复相对路径，不同步代码')
@@ -36,7 +39,9 @@ def parser() -> argparse.ArgumentParser:
     x.add_argument('--overwrite', action='store_true', help='显式允许覆盖已有文件')
     x = sub.add_parser('run', help='创建 Colab session，后台运行，默认等待成功并释放资源')
     x.add_argument('project'); x.add_argument('--job', default='example'); x.add_argument('--input', action='append', default=[])
-    x.add_argument('--gpu', default='L4', help='GPU 类型(T4, L4, A100, H100, G4)或 CPU 免费模式')
+    x.add_argument('--gpu', help='GPU 类型(T4, L4, A100, H100, G4)或 CPU/NONE；省略时使用 settings.toml 的 [colab].default_gpu（默认 L4）')
+    x.add_argument('--high-mem', action=argparse.BooleanOptionalAction, default=None,
+                   help='请求高内存机型（如 A100）；--no-high-mem 可覆盖配置，省略时读取 [colab].high_mem')
     x.add_argument('--session')
     x.add_argument('--detach', action='store_true', help='不等待；之后用 watch 监视/自动停止')
     x.add_argument('--allow-dirty', action='store_true', help='使用 HEAD，忽略本地未提交代码变更')
@@ -50,6 +55,11 @@ def parser() -> argparse.ArgumentParser:
     x.add_argument('--no-stop', action='store_true')
     x = sub.add_parser('stop', help='手动释放 session（如果未发布输出，可能丢失数据）')
     x.add_argument('session')
+    x = sub.add_parser('ssh', help='SSH 单次读取既有实例的系统状态；支持自定义远端命令，不创建/停止实例')
+    x.add_argument('session')
+    x.add_argument('--timeout', type=int, default=60, help='连接与执行的总秒数（5–3600）')
+    x.add_argument('--identity', help='已有的 ed25519/ecdsa 私钥路径（默认先检查 MLBridge 配置目录 ssh/id_ed25519）')
+    x.add_argument('command', nargs=argparse.REMAINDER, help='可选：-- 后接远端命令及参数；不填则输出系统快照')
     return p
 
 
@@ -73,15 +83,18 @@ def execute(args):
             mode = oct(pw.stat().st_mode & 0o777) if pw.is_file() else '-'
             print('restic password file:', 'EXISTS' if pw.is_file() else 'MISSING', mode)
             if shutil.which('rclone') and expand(s['rclone_config']).is_file():
+                # 只捕获 BridgeError（rclone 退出码非零/超时等运行时失败）；
+                # 编程错误（NameError/KeyError 等）绝不能被伪装成“网络未连通”。
                 try:
                     proc(['rclone', 'about', f"{s['remote']}:"],
                          cwd=Path.home(), env=secret_env(s), capture=True, timeout=5)
                     print(f'rclone remote ({s["remote"]}): CONNECTED (已验证云端连通性)')
-                except Exception:
-                    print(f'rclone remote ({s["remote"]}): UNVERIFIED (网络未连通或需刷新凭据)')
+                except BridgeError as exc:
+                    print(f'rclone remote ({s["remote"]}): UNVERIFIED '
+                          f'(rclone 运行失败或网络未连通: {exc})')
             try:
                 ok = restic_overwrite_supported()
-                print('restic --overwrite:', 'supported' if ok else 'NOT supported (restic < 0.16.2)')
+                print('restic --overwrite:', 'supported' if ok else 'NOT supported (restic < 0.17.0)')
             except BridgeError:
                 print('restic --overwrite: unknown (restic 未安装)')
             if args.project:
@@ -94,7 +107,8 @@ def execute(args):
         restic(args.project, settings(), ['init'])
         print('已初始化该项目的 restic 仓库。')
     elif a == 'publish':
-        snap = publish(args.project, args.paths, args.label)
+        snap = publish(args.project, args.paths, args.label,
+                       materialize_links=not args.no_materialize_links)
         print(json.dumps({'project': args.project, 'label': args.label,
                           'snapshot_id': snap}, ensure_ascii=False))
     elif a == 'fetch':
@@ -110,7 +124,7 @@ def execute(args):
                               'tags': obj.get('tags')}, ensure_ascii=False))
     elif a == 'run':
         session = launch(args.project, args.job, args.input, args.gpu,
-                         allow_dirty=args.allow_dirty, session=args.session,
+                         high_mem=args.high_mem, allow_dirty=args.allow_dirty, session=args.session,
                          allow_empty_input=args.allow_empty_input)
         print('任务已独立启动，session:', session, flush=True)
         print(f'调试：colab ssh -s {session} （不要用 --rm）', flush=True)
@@ -118,7 +132,7 @@ def execute(args):
             print('监视状态直到完成；Ctrl-C 不会故意停止远端训练。', flush=True)
             result = watch(session)
             print(json.dumps(result, ensure_ascii=False, indent=2))
-            if result.get('phase') != 'SUCCEEDED':
+            if result.get('phase') != 'SUCCEEDED' or result.get('stop_error'):
                 return 1
         else:
             print(f'稍后执行 mlbridge watch {session}，在完成时释放 GPU。')
@@ -136,11 +150,17 @@ def execute(args):
     elif a == 'watch':
         result = watch(args.session, interval=args.interval, auto_stop=not args.no_stop)
         print(json.dumps(result, ensure_ascii=False, indent=2))
-        if result.get('phase') != 'SUCCEEDED':
+        if result.get('phase') != 'SUCCEEDED' or result.get('stop_error'):
             return 1
     elif a == 'stop':
         shutdown(args.session)
         print('Colab session 已停止:', args.session)
+    elif a == 'ssh':
+        if args.command[:1] != ['--'] and args.command[:1] in (['--timeout'], ['--identity']):
+            raise BridgeError('ssh 的 --timeout/--identity 需写在 <session> 前；'
+                              '远端命令请放在 <session> -- 后')
+        cmd = args.command[1:] if args.command[:1] == ['--'] else args.command
+        ssh_observe(args.session, cmd or None, timeout=args.timeout, identity=args.identity)
     return 0
 
 

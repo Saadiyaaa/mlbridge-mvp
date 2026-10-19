@@ -9,6 +9,9 @@ import json
 import os
 import subprocess
 import sys
+from types import ModuleType
+
+import pytest
 
 from mlbridge import remote_worker
 
@@ -84,8 +87,37 @@ def _run_worker(tmp_path, monkeypatch, fake_version):
                             if ' restore ' in line]}
 
 
+def test_worker_missing_credential_records_failure_and_cleans_remaining(tmp_path, monkeypatch):
+    base = tmp_path / 'remote-root'
+    base.mkdir()
+    (base / 'mlbridge_job.json').write_text('{}')
+    (base / 'mlbridge_rclone.conf').write_text('test credential')
+    monkeypatch.setattr(remote_worker, 'BASE', base)
+    monkeypatch.setattr(remote_worker, 'STATE', base / 'mlbridge_state.json')
+    monkeypatch.setattr(remote_worker, 'PLAN', base / 'mlbridge_job.json')
+    with pytest.raises(FileNotFoundError):
+        remote_worker.main()
+    assert not (base / 'mlbridge_rclone.conf').exists()
+    state = json.loads((base / 'mlbridge_state.json').read_text())
+    assert state['phase'] == 'FAILED' and 'FileNotFoundError' in state['error']
+
+
+def test_worker_does_not_unassign_before_local_watch(tmp_path, monkeypatch):
+    google = ModuleType('google')
+    colab = ModuleType('google.colab')
+    calls = []
+    colab.runtime = ModuleType('google.colab.runtime')
+    colab.runtime.unassign = lambda: calls.append('unassign')
+    google.colab = colab
+    monkeypatch.setitem(sys.modules, 'google', google)
+    monkeypatch.setitem(sys.modules, 'google.colab', colab)
+    result = _run_worker(tmp_path, monkeypatch, '0.17.0')
+    assert result['state']['phase'] == 'SUCCEEDED'
+    assert calls == []
+
+
 def test_worker_snapshot_wins_over_tracked_files(tmp_path, monkeypatch):
-    """restic ≥0.16.2:恢复输入必须显式 --overwrite always,快照覆盖 tracked 文件。"""
+    """restic ≥0.17.0:恢复输入必须显式 --overwrite always,快照覆盖 tracked 文件。"""
     result = _run_worker(tmp_path, monkeypatch, '0.17.0')
     assert result['state']['phase'] == 'SUCCEEDED'
     assert len(result['state']['snapshot_id']) == 64
@@ -97,6 +129,15 @@ def test_worker_snapshot_wins_over_tracked_files(tmp_path, monkeypatch):
     # 凭据清理不变
     assert not (result['base'] / 'mlbridge_rclone.conf').exists()
     assert not (result['base'] / 'mlbridge_restic_password').exists()
+
+
+def test_worker_ubuntu_restic_0164_without_overwrite_flag(tmp_path, monkeypatch):
+    """Colab apt 的 restic 0.16.4 不支持 --overwrite，必须沿用缺省覆盖。"""
+    result = _run_worker(tmp_path, monkeypatch, '0.16.4')
+    assert result['state']['phase'] == 'SUCCEEDED'
+    assert (result['ws'] / 'outputs' / 'img.png').read_bytes() == b'SNAPSHOT'
+    assert result['restore_log']
+    assert all('--overwrite' not in line for line in result['restore_log'])
 
 
 def test_worker_legacy_restic_without_overwrite_flag(tmp_path, monkeypatch):

@@ -16,6 +16,7 @@ from typing import Any
 
 IDENTITY = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}$")
 SNAPSHOT = re.compile(r"^[a-f0-9]{8,64}$")
+GPU_CHOICES = frozenset({'T4', 'L4', 'A100', 'H100', 'G4', 'CPU', 'NONE'})
 
 
 class BridgeError(RuntimeError):
@@ -29,7 +30,10 @@ def ident(value: str) -> str:
 
 
 def app_dir(env_name: str, fallback: str) -> Path:
-    return Path(os.environ.get(env_name, str(Path.home() / fallback))).expanduser() / "mlbridge"
+    # 空字符串视为未设置：否则 Path("") 会产生相对路径 "mlbridge"，
+    # 配置/状态会悄悄落到当前工作目录而不是用户主目录。
+    base = os.environ.get(env_name) or str(Path.home() / fallback)
+    return Path(base).expanduser() / "mlbridge"
 
 
 def config_dir() -> Path:
@@ -68,6 +72,29 @@ def settings() -> dict[str, str]:
         if not isinstance(store.get(key), str) or not store[key]:
             raise BridgeError(f"settings.toml 缺少 storage.{key}")
     return {k: str(v) for k, v in store.items()}
+
+
+def _colab_settings() -> dict[str, Any]:
+    colab = read_toml(config_dir() / "settings.toml").get("colab", {})
+    if not isinstance(colab, dict):
+        raise BridgeError("settings.toml 的 [colab] 必须是表")
+    return colab
+
+
+def default_gpu() -> str:
+    """Read the global Colab default; older settings without [colab] use L4."""
+    gpu = _colab_settings().get("default_gpu", "L4")
+    if not isinstance(gpu, str) or gpu.upper() not in GPU_CHOICES:
+        raise BridgeError("settings.toml 的 colab.default_gpu 无效；支持 T4, L4, A100, H100, G4, CPU (或 NONE)")
+    return gpu.upper()
+
+
+def default_high_mem() -> bool:
+    """Older settings without high_mem keep the normal-memory machine shape."""
+    high_mem = _colab_settings().get("high_mem", False)
+    if not isinstance(high_mem, bool):
+        raise BridgeError("settings.toml 的 colab.high_mem 必须为 true 或 false")
+    return high_mem
 
 
 def expand(v: str) -> Path:
@@ -118,7 +145,11 @@ def proc(cmd: list[str], *, cwd: Path | None = None,
          env: dict[str, str] | None = None, capture: bool = False,
          timeout: int | None = None) -> subprocess.CompletedProcess:
     try:
-        return subprocess.run(cmd, cwd=cwd, env=env, text=True,
+        # The GitHub PAT belongs only in the short-lived upload file. Never
+        # inherit it into local git/restic/rclone/colab child processes.
+        child_env = dict(os.environ if env is None else env)
+        child_env.pop('MLBRIDGE_GITHUB_TOKEN', None)
+        return subprocess.run(cmd, cwd=cwd, env=child_env, text=True,
                               stdout=subprocess.PIPE if capture else None,
                               stderr=subprocess.PIPE if capture else None,
                               timeout=timeout, check=True)
@@ -161,22 +192,57 @@ def parse_backup_output(text: str) -> str:
     return found
 
 
-def publish(name: str, paths: list[str], label: str) -> str:
+def publish(name: str, paths: list[str], label: str, *,
+            materialize_links: bool = True) -> str:
+    """Publish selected relative paths; final-component links are real data by default.
+
+    A single temporary staging tree is used only when one of the explicit
+    paths is a symlink. Ordinary paths keep their existing backup behavior.
+    """
     cfg, store = project(name), settings()
     root = expand(cfg["workspace"])
-    rel = validate_paths(root, paths)
     label = ident(label)
-    r = restic(name, store, ["backup", "--json",
-                             "--tag", f"mlbridge-project-{name}",
-                             "--tag", f"mlbridge-artifact-{label}", *rel],
-               cwd=root, capture=True)
-    return parse_backup_output(r.stdout)
+
+    def backup(cwd: Path, rel: list[str]) -> str:
+        r = restic(name, store, ["backup", "--json",
+                                 "--tag", f"mlbridge-project-{name}",
+                                 "--tag", f"mlbridge-artifact-{label}", *rel],
+                   cwd=cwd, capture=True)
+        return parse_backup_output(r.stdout)
+
+    # Do not follow arbitrary ancestors or walk a parent directory to discover
+    # more links: only paths explicitly named on the command line can opt in.
+    rel = [checked_relative(p) for p in paths]
+    for p in rel:
+        parts = Path(p).parts
+        for i in range(1, len(parts)):
+            if (root / Path(*parts[:i])).is_symlink():
+                raise BridgeError(f'发布路径经过软链接祖先，请直接选择链接本身: {p}')
+    if materialize_links and any((root / p).is_symlink() for p in rel):
+        from .materialize import materialized_inputs
+        with materialized_inputs(root, rel) as (stage, selected):
+            return backup(stage, selected)
+    rel = validate_paths(root, rel)
+    if materialize_links:
+        # A parent selection like --path models must not silently publish a
+        # dangling model symlink. Require selecting that link explicitly.
+        for p in rel:
+            if (root / p).is_dir():
+                def on_error(exc: OSError) -> None:
+                    raise BridgeError(f'无法检查发布目录中的软链接: {p} ({exc})') from exc
+                for current, dirs, files in os.walk(root / p, onerror=on_error):
+                    for entry_name in dirs + files:
+                        if (Path(current) / entry_name).is_symlink():
+                            raise BridgeError(
+                                f'发布目录内有软链接 {Path(current, entry_name).relative_to(root)}；'
+                                '请单独 --path 选择该链接，或使用 --no-materialize-links')
+    return backup(root, rel)
 
 
-# restic 在 0.16.2 才引入 restore --overwrite {always,if-changed,never}。
+# restic 在 0.17.0 才引入 restore --overwrite {always,if-changed,never}。
 # 更老的版本恢复时无条件覆盖；本机/Colab 的发行版 restic 常为 0.12.x，
 # 必须探测后再传参，否则会报 unknown flag。
-_OVERWRITE_MIN = (0, 16, 2)
+_OVERWRITE_MIN = (0, 17, 0)
 _OVERWRITE_OK: dict[str, bool] = {}
 
 
@@ -203,7 +269,7 @@ def fetch(name: str, snapshot: str, *, target: Path | None = None,
     elif not overwrite:
         # 老版本 restic 无法表达“从不覆盖”，静默恢复会覆盖已有文件。
         raise BridgeError(
-            "本机 restic 版本过旧（支持 --overwrite 需 ≥ 0.16.2）。"
+            "本机 restic 版本过旧（支持 --overwrite 需 ≥ 0.17.0）。"
             "默认的“从不覆盖”安全恢复无法保证；请升级 restic，"
             "或明确加 --overwrite 接受覆盖语义")
     # 老版本 restic 在显式请求 overwrite 时默认行为即无条件覆盖，无需传参。
@@ -211,30 +277,81 @@ def fetch(name: str, snapshot: str, *, target: Path | None = None,
     return root
 
 
-def check_git_pushed(root: Path) -> None:
+def _normalize_git_url(url: str) -> str:
+    # 仅做本地区分用的一致化：去尾斜杠和 .git 后缀，不做网络请求。
+    url = url.strip().rstrip("/")
+    if url.endswith(".git"):
+        url = url[:-len(".git")]
+    return url
+
+
+def check_git_pushed(root: Path, repository: str | None = None) -> None:
+    """Fail closed：任何无法在本地证明“HEAD 已在配置远端上”的情况都拒绝。
+
+    只用本地 git 元数据（remote-tracking 引用），不联网。唯一绕过方式是
+    显式 --allow-dirty（由 git_commit 的 allow_dirty 参数控制）。
+    """
     try:
         upstream = proc(["git", "rev-parse", "--abbrev-ref", "@{u}"],
                         cwd=root, capture=True).stdout.strip()
-    except BridgeError:
-        # 无上游跟踪分支（例如纯本地测试仓库或新分支），不阻断
-        return
+    except BridgeError as exc:
+        raise BridgeError(
+            "无法确定当前分支的上游跟踪分支（git rev-parse @{u} 失败，"
+            "例如无 upstream 或游离 HEAD）；本地无法证明提交已推送到远端。"
+            "请先配置 upstream 并 git push，或显式使用 --allow-dirty 跳过"
+        ) from exc
+    if not upstream:
+        raise BridgeError(
+            "无法确定当前分支的上游跟踪分支；本地无法证明提交已推送到远端。"
+            "请先配置 upstream 并 git push，或显式使用 --allow-dirty 跳过")
 
-    if upstream:
+    if repository:
+        remote = None
+        # 最长匹配优先，兼容名字含 '/' 的 remote（罕见但合法）。
+        for name in sorted(proc(["git", "remote"], cwd=root,
+                                capture=True).stdout.split(), key=len, reverse=True):
+            if upstream.startswith(name + "/"):
+                remote = name
+                break
+        if remote is None:
+            raise BridgeError(
+                f"上游 {upstream} 无法映射到任何 git remote；"
+                f"本地无法证明提交已推送到配置的仓库 {repository}。"
+                "请修正项目 repository 配置，或显式使用 --allow-dirty 跳过")
         try:
-            unpushed = proc(["git", "rev-list", f"{upstream}..HEAD"],
-                            cwd=root, capture=True).stdout.strip()
-            if unpushed:
-                count = len(unpushed.splitlines())
-                raise BridgeError(
-                    f"检测到本地有 {count} 个未推送(git push)的代码提交，远端 Colab 将无法拉取；"
-                    "请先执行 git push，或使用 --allow-dirty 忽略"
-                )
+            actual = proc(["git", "remote", "get-url", remote],
+                          cwd=root, capture=True).stdout.strip()
         except BridgeError as exc:
-            if "未推送" in str(exc):
-                raise
+            raise BridgeError(
+                f"无法读取 git remote {remote} 的 URL；"
+                f"本地无法证明提交已推送到配置的仓库 {repository}") from exc
+        if _normalize_git_url(actual) != _normalize_git_url(repository):
+            raise BridgeError(
+                f"项目配置的 repository 是 {repository}，但当前分支的上游是 "
+                f"git remote {remote} ({actual})；本地无法证明提交已推送到配置的仓库。"
+                "请推送/修改配置使其一致，或显式使用 --allow-dirty 跳过")
+
+    try:
+        unpushed = proc(["git", "rev-list", f"{upstream}..HEAD"],
+                        cwd=root, capture=True).stdout.strip()
+    except BridgeError as exc:
+        raise BridgeError(
+            f"无法验证本地提交是否已在 {upstream} 上（git rev-list 失败：{exc}）；"
+            "本地无法证明提交已推送到远端。请先 git fetch/push，"
+            "或显式使用 --allow-dirty 跳过") from exc
+    if unpushed:
+        count = len(unpushed.splitlines())
+        raise BridgeError(
+            f"检测到本地有 {count} 个未推送(git push)的代码提交，远端 Colab 将无法拉取；"
+            "请先执行 git push，或使用 --allow-dirty 忽略")
 
 
-def git_commit(root: Path, allow_dirty: bool) -> str:
+def git_commit(root: Path, allow_dirty: bool, repository: str | None = None) -> str:
+    """repository 传项目配置的 repo URL 时，同时校验上游即该仓库。
+
+    保持前两个位置参数不变：旧调用 git_commit(root, allow_dirty) 仍有效，
+    只是不做 repository 一致性校验；launch 处应传入 cfg['repository']。
+    """
     if not root.is_dir():
         raise BridgeError(f"项目目录不存在: {root}")
     if not allow_dirty:
@@ -242,7 +359,7 @@ def git_commit(root: Path, allow_dirty: bool) -> str:
                      cwd=root, capture=True).stdout
         if dirty.strip():
             raise BridgeError("项目存在未提交的已跟踪代码改动；先提交推送或使用 --allow-dirty")
-        check_git_pushed(root)
+        check_git_pushed(root, repository)
     return proc(["git", "rev-parse", "HEAD"], cwd=root, capture=True).stdout.strip()
 
 
@@ -258,7 +375,8 @@ def new_settings() -> Path:
         pw.chmod(0o600)
     rc = Path.home() / ".config/rclone/rclone.conf"
     path.write_text('[storage]\nremote = "gdrive"\nprefix = "mlbridge"\n'
-                    f'password_file = "{pw}"\nrclone_config = "{rc}"\n', encoding="utf-8")
+                    f'password_file = "{pw}"\nrclone_config = "{rc}"\n'
+                    '\n[colab]\ndefault_gpu = "L4"\nhigh_mem = false\n', encoding="utf-8")
     path.chmod(0o600)
     return path
 

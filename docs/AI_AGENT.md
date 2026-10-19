@@ -16,11 +16,11 @@
    - 调度任务输入必须采用显式 64 位不可变 Snapshot ID。
    - 严禁使用任何形式的动态标签（如 `latest`）作为依赖输入。
 4. **实例关停安全规则 (Teardown Guardrail)**：
-   - 仅在任务明确报告 `SUCCEEDED` 且已生成新产物 Snapshot ID 时，允许关停 Colab 实例。
+   - 默认由 `watch` 在读取 `SUCCEEDED` 后关停 Colab 实例；无输出任务的 Snapshot ID 可以为空。使用 `--detach` 或 `watch --no-stop` 时必须自行跟进并停止实例，否则可能持续计费。
    - 状态为 `FAILED` 时必须保留实例现场，供调试与日志排查。
    - 遇到 `UNREACHABLE` 状态时，属于网络通信中断，严禁执行 `stop`，必须提示重连或保持等待。
 5. **凭据安全准则 (Credential Redaction Rule)**：
-   - 严禁在对话上下文、终端日志或状态报告中输出 `rclone.conf` 内容、OAuth Token 或 restic 仓库密码。
+   - 严禁在对话上下文、终端日志或状态报告中输出 `rclone.conf` 内容、OAuth Token、GitHub PAT 或 restic 仓库密码。私有 GitHub HTTPS 仓库优先使用显式成对的 `MLBRIDGE_GITHUB_USERNAME` + `MLBRIDGE_GITHUB_TOKEN` 环境变量；两者均未设置时从本地 `~/.config/zsh/private/secrets.env` 用 `awk` 读取这两个键（不 source）；不得填入项目 TOML、Git URL、CLI 参数或远程命令。
 
 ---
 
@@ -35,6 +35,7 @@ mlbridge artifacts <PROJECT_NAME>
 
 # 3. 发布未上云的输入数据（若需）
 mlbridge publish <PROJECT_NAME> --label <LABEL> --path <RELATIVE_DATA_PATH>
+# 显式选中的模型/数据软链接默认物化为真实文件；目录内部嵌套链接会拒绝
 
 # 4. 提交远程任务至计算节点
 mlbridge run <PROJECT_NAME> --job <JOB_NAME> --input <SNAPSHOT_ID> --gpu <GPU_TYPE>
@@ -42,7 +43,9 @@ mlbridge run <PROJECT_NAME> --job <JOB_NAME> --input <SNAPSHOT_ID> --gpu <GPU_TY
 # 5. 后台轮询与状态追踪（支持分离执行）
 mlbridge status <SESSION_ID>
 mlbridge logs <SESSION_ID> --lines 100
-mlbridge watch <SESSION_ID>
+mlbridge watch <SESSION_ID>  # 默认成功后关停；--no-stop 会保留实例
+# 如果由 Agent 自行轮询：run --detach 后可定时执行 mlbridge ssh <SESSION_ID>
+# 或 mlbridge ssh <SESSION_ID> -- nvidia-smi；SSH 失败不等于任务失败
 ```
 
 ---
@@ -66,10 +69,11 @@ Agent 在向用户汇报任务执行结果时，输出报告必须包含以下�
 
 ## 4. 异常处理与诊断协议
 
+* **系统级观测**：`mlbridge ssh <SESSION_ID>` 每次只连接既有实例并输出 GPU、CPU/内存、进程、磁盘和产物大小；Agent 可执行 `mlbridge ssh <SESSION_ID> -- <命令...>` 读取其他系统指标（远端 `root` 权限，仅限可信 Agent）。SSH 断线/限流只表示本次观测失败；不可据此关机或判定训练失败。该接口不读项目业务日志、不依赖项目代码。
 * **诊断连接**：若任务失败，建议用户使用官方命令连接实例现场：
   ```bash
   colab ssh -s <SESSION_ID>
   ```
-  *严禁附加 `--rm` 旗标，以防 SSH 会话关闭时误删实例。*
+  *此官方命令在目标会话不存在时可能自动新建实例；先核对 `colab sessions`，严禁附加 `--rm` 旗标，以防 SSH 会话关闭时误删实例。常规观测优先使用 `mlbridge ssh`。*
 * **日志提取**：优先调用 `mlbridge logs <SESSION_ID> --lines 200` 提取报错关键日志堆栈，不要下载全量日志文件。
-* **确认关机**：在排查完毕后，由用户确认再调用 `mlbridge stop <SESSION_ID>` 释放实例，防止持续计费。
+* **确认关机**：在排查完毕后，由用户确认再调用 `mlbridge stop <SESSION_ID>` 释放实例，防止持续计费。若 `watch` 返回 `stop_error`（退出码 1），应重试关停或手动核对实例状态，不能把成功结果当作已释放算力。
