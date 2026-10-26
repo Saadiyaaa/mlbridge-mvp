@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 from . import __version__
+from .checkpoints import discover_checkpoints
 from .colab_runner import get_local, get_status, launch, logs, shutdown, watch
 from .ssh_observe import ssh_observe
 from .core import (BridgeError, config_dir, expand, fetch, new_settings,
@@ -33,6 +34,13 @@ def parser() -> argparse.ArgumentParser:
                    help='不物化显式选中的软链接（外部链接将被拒绝）')
     x = sub.add_parser('artifacts', help='列出项目快照及其标签')
     x.add_argument('project')
+    x = sub.add_parser('checkpoints', help='只读发现某 session 的逐 key checkpoint 快照'
+                        '（不构成验收；同 key 多快照一律报冲突，rc=3）')
+    x.add_argument('session')
+    x.add_argument('--project', required=True)
+    x.add_argument('--key', help='只查给定检测 key（与 checkpoint --request 里的 key 同值；'
+                        '便于中央跨主机按 key hash 对照）')
+    x.add_argument('--json', action='store_true', help='输出机器可读 JSON（含冲突覆盖）')
     x = sub.add_parser('fetch', help='按 snapshot ID 恢复相对路径，不同步代码')
     x.add_argument('project'); x.add_argument('snapshot')
     x.add_argument('--target', type=Path, help='默认当前注册工作区')
@@ -126,6 +134,18 @@ def execute(args):
         for obj in json.loads(out.stdout):
             print(json.dumps({'id': obj.get('id'), 'time': obj.get('time'),
                               'tags': obj.get('tags')}, ensure_ascii=False))
+    elif a == 'checkpoints':
+        result = discover_checkpoints(args.session, args.project, key=args.key)
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        else:
+            for entry in result['keys']:
+                for snap in entry['snapshots']:
+                    print(f"{entry['key_sha256'][:16]}  {entry['state']:20s}  "
+                          f"{snap['snapshot_id']}  {snap['time']}  "
+                          f"meta={snap['metadata_sha256']}")
+            print('注意: ' + result['note'])
+        return 3 if result['conflicts'] else 0
     elif a == 'run':
         session = launch(args.project, args.job, args.input, args.gpu,
                          high_mem=args.high_mem, allow_dirty=args.allow_dirty, session=args.session,
