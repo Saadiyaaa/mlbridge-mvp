@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -142,8 +143,13 @@ class FakeVM:
             if name == 'mlbridge_worker.py':
                 # 测试镜像远端 patch：/content → 本测试目录（与真实上传
                 # 无关；对上传集合/内容契约只做目录绑定替换）。
-                data = data.replace("BASE = Path('/content')",
-                                    f"BASE = Path({str(root)!r})")
+                # 远端 worker 的 BASE 以环境变量覆盖（缺省 /content）；
+                # 这里把整行重绑到本测试目录（离线镜像，不改变上传契约）。
+                data, replaced = re.subn(
+                    r"BASE = Path\(os\.environ\.get\('MLBRIDGE_WORKER_BASE'\)"
+                    r" or '/content'\)",
+                    f"BASE = Path({str(root)!r})", data)
+                assert replaced == 1, 'staged worker 的 BASE 定义形状变了' 
                 assert str(root) in data
                 assert _imports_mlbridge(data) is False
             if name == 'batch_worker.py':

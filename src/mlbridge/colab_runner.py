@@ -168,11 +168,92 @@ def get_local(session: str) -> dict:
         raise BridgeError(f'找不到本地任务记录 {session}') from exc
 
 
+def launch_trace_path(session: str) -> Path:
+    """本地 launch/exec/starter 边界的诊断留证文件（JSONL，有界裁剪）。"""
+    if not SESSION.fullmatch(session):
+        raise BridgeError('session ID 不合法')
+    return state_dir() / 'diagnostics' / f'launch-{session}.jsonl'
+
+
+_TRACE_MAX_BYTES = 512 * 1024
+_TRACE_KEEP_BYTES = 64 * 1024
+
+
+def _trace_launch(session: str, event: dict) -> None:
+    """追加一条 JSON 事件到 launch 轨迹文件；失败静默（诊断不砸主流程）。
+
+    只留边界事实（阶段/调用/rc/耗时/有界输出尾部），绝不含凭据或文件内容。
+    """
+    try:
+        path = launch_trace_path(session)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        record = {'observed': datetime.now(timezone.utc).isoformat(), **event}
+        data = (json.dumps(record, ensure_ascii=False, default=str) + '\n').encode('utf-8')
+        if len(data) > _TRACE_KEEP_BYTES:
+            data = (json.dumps({'observed': record['observed'],
+                                'event': str(event.get('event', 'unknown'))[:128],
+                                'oversize_event_omitted': True,
+                                'omitted_bytes': len(data)}) + '\n').encode('utf-8')
+        with path.open('ab') as fh:
+            fh.write(data)
+        path.chmod(0o600)
+        if path.stat().st_size > _TRACE_MAX_BYTES:
+            # Rotate by bytes, but retain only complete JSONL rows. A raw
+            # character tail could cut through a row or a UTF-8 code point.
+            with path.open('rb') as fh:
+                fh.seek(-_TRACE_KEEP_BYTES, os.SEEK_END)
+                fh.readline()  # discard the partial first row
+                keep = fh.read()
+            tmp = path.with_name(path.name + '.rotate-' + secrets.token_hex(4))
+            try:
+                with tmp.open('xb') as fh:
+                    fh.write(keep)
+                tmp.chmod(0o600)
+                os.replace(tmp, path)
+            finally:
+                tmp.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _tail(text: object, limit: int = 4000) -> str:
+    if text is None:
+        return ''
+    if isinstance(text, bytes):
+        text = text.decode('utf-8', 'replace')
+    return str(text).strip()[-limit:]
+
+
+def _completion_fields(result) -> dict:
+    """Diagnostics tolerate legacy adapters with no captured result.
+
+    Missing fields remain unknown, never a fabricated successful return code.
+    """
+    return {'rc': getattr(result, 'returncode', None),
+            'stdout': _tail(getattr(result, 'stdout', '')),
+            'stderr': _tail(getattr(result, 'stderr', ''))}
+
+
+def _echo(result: subprocess.CompletedProcess) -> None:
+    """把捕获的 colab CLI 输出放回控制台，保持原有可见行为。"""
+    out = getattr(result, 'stdout', '')
+    err = getattr(result, 'stderr', '')
+    out = out if isinstance(out, str) else ''
+    err = err if isinstance(err, str) else ''
+    if out:
+        sys.stdout.write(out if out.endswith('\n') else out + '\n')
+        sys.stdout.flush()
+    if err:
+        sys.stderr.write(err if err.endswith('\n') else err + '\n')
+        sys.stderr.flush()
+
+
 def cli(*args, capture=False, timeout=None):
     return proc(['colab', *args], capture=capture, timeout=timeout)
 
 
-def cli_retry(*args, timeout, attempts=STAGE_ATTEMPTS, backoff=STAGE_BACKOFF):
+def cli_retry(*args, capture=False, timeout, attempts=STAGE_ATTEMPTS,
+              backoff=STAGE_BACKOFF):
     """有界重试的幂等 colab 调用；仅在重试预算内重试，不重新分配实例。"""
     last: Exception | None = None
     for attempt in range(attempts):
@@ -181,7 +262,7 @@ def cli_retry(*args, timeout, attempts=STAGE_ATTEMPTS, backoff=STAGE_BACKOFF):
                   f'({attempt + 1}/{attempts})', file=sys.stderr, flush=True)
             time.sleep(backoff)
         try:
-            return cli(*args, timeout=timeout)
+            return cli(*args, capture=capture, timeout=timeout)
         except BridgeError as exc:
             last = exc
     raise BridgeError(
@@ -193,6 +274,8 @@ def cli_retry(*args, timeout, attempts=STAGE_ATTEMPTS, backoff=STAGE_BACKOFF):
 # 每个活跃 session 一行 "[name] endpoint | Hardware: … | Shape: … | Variant: …"。
 _NO_SESSIONS_MARKER = 'no active sessions'
 _SESSION_LINE = re.compile(r'^\[([^\]]+)\]\s*(\S+)')
+# starter 输出里的 remote worker PID（本地留证用；解析失败不影响流程）。
+_STARTER_PID = re.compile(r'MLBridge remote PID:\s*(\d+)')
 
 
 def list_active_sessions() -> list[str]:
@@ -467,15 +550,46 @@ def starter_script(execution_mode: str = 'detached') -> str:
 
 
 def put_script(session: str, contents: str):
-    """执行幂等脚本（prepare/askpass/cleanup/logs 等），允许有界重试。"""
+    """执行幂等脚本（prepare/askpass/cleanup/logs 等），允许有界重试。
+
+    输出在本地边界处捕获留证（exec 边界 stage/rc/时间/尾部）后回显。
+    """
     with tempfile.TemporaryDirectory(prefix='mlbridge-colab-') as t:
         p = Path(t) / 'script.py'
         p.write_text(contents)
-        cli_retry('exec', '-s', session, '-f', str(p), timeout=EXEC_TIMEOUT)
+        started = time.monotonic()
+        try:
+            r = cli_retry('exec', '-s', session, '-f', str(p),
+                          timeout=EXEC_TIMEOUT, capture=True)
+        except BridgeError as exc:
+            _trace_launch(session, {'event': 'exec-failed', 'kind': 'put-script',
+                                    'seconds': round(time.monotonic() - started, 3),
+                                    'error': _tail(str(exc), 2000)})
+            raise
+        _trace_launch(session, {'event': 'exec', 'kind': 'put-script',
+                                'seconds': round(time.monotonic() - started, 3),
+                                **_completion_fields(r)})
+        _echo(r)
 
 
-def exec_starter_once(session: str, contents: str,*, timeout: float | None = None,
-                      capture: bool = False):
+class StarterRun:
+    """Result of ONE starter execution.
+
+    ``completed`` is the bounded ``cli exec`` completion; ``remote_pid`` is the
+    PID the starter echoed (diagnostics only — an unparseable line is NOT a
+    failure and never changes publish semantics).
+    """
+
+    __slots__ = ('completed', 'remote_pid')
+
+    def __init__(self, completed, remote_pid: int | None) -> None:
+        self.completed = completed
+        self.remote_pid = remote_pid
+
+
+def exec_starter_once(session: str, contents: str, *,
+                      timeout: float | None = None,
+                      capture: bool = False) -> StarterRun:
     """执行 starter 脚本，且只执行一次（绝不重试）。
 
     starter 内部启动 remote_worker，不是幂等操作：若 exec 回复丢失后重
@@ -484,17 +598,38 @@ def exec_starter_once(session: str, contents: str,*, timeout: float | None = Non
     性回收（见 _staging_failed），绝不自动重发。
 
     超时（ProcessTimeout）只表示本地观测中断：远端 worker 可能仍在运行、
-    也可能已随连接终止；绝不据此外押任何“远端已失败”的结论，交由
+    也可能已随连接终止；绝不据此外押任何"远端已失败"的结论，交由
     watch/对账依据远端事实（state/回执/快照 tags）判定。
 
-    capture=True（foreground 用）时返回 CompletedProcess 以便调用方读取
-    有界的 cell 输出（哨兵行）；闭合连接时 stdout 仍打印给用户。
+    输出总在本地边界留证（原始 stdout/stderr 尾部，含 starter 打印的
+    remote PID）并回显给用户；返回值同时携带 completion 与解析出的 PID，
+    因此 foreground 的哨兵行读取与 launch 诊断共用同一次 exec。
     """
     with tempfile.TemporaryDirectory(prefix='mlbridge-colab-') as t:
-        p = Path(t) / 'script.py'
+        p = Path(t) / 'starter.py'
         p.write_text(contents)
-        return cli('exec', '-s', session, '-f', str(p), capture=capture,
-                   timeout=EXEC_TIMEOUT if timeout is None else timeout)
+        started = time.monotonic()
+        try:
+            r = cli('exec', '-s', session, '-f', str(p), capture=True,
+                    timeout=EXEC_TIMEOUT if timeout is None else timeout)
+        except BridgeError as exc:
+            _trace_launch(session, {'event': 'starter-failed',
+                                    'seconds': round(time.monotonic() - started, 3),
+                                    'error': _tail(str(exc), 2000),
+                                    'note': 'starter 只执行一次；传输丢失≠worker 未启动'})
+            raise
+    _trace_launch(session, {'event': 'starter',
+                            'seconds': round(time.monotonic() - started, 3),
+                            **_completion_fields(r)})
+    _echo(r)
+    captured = getattr(r, 'stdout', '')
+    remote_pid = None
+    for line in (captured if isinstance(captured, str) else '').splitlines():
+        matched = _STARTER_PID.search(line)
+        if matched:
+            remote_pid = int(matched.group(1))
+            break
+    return StarterRun(r, remote_pid)
 
 
 def foreground_exec_timeout(content: dict) -> float:
@@ -651,9 +786,22 @@ def _stage_github_auth(session: str, user: str, token: str) -> None:
 
 
 def stage(session: str, src: Path, remote_basename: str):
-    # 覆盖同一远端路径，重试是幂等的。
-    cli_retry('upload', '-s', session, str(src), f'/content/{remote_basename}',
-              timeout=UPLOAD_TIMEOUT)
+    # 覆盖同一远端路径，重试是幂等的。捕获 CLI 输出：边界处本地留证
+    # （stage/rc/时间/输出尾部），控制台行为不变（回显），失败不丢根错误。
+    started = time.monotonic()
+    try:
+        r = cli_retry('upload', '-s', session, str(src), f'/content/{remote_basename}',
+                      timeout=UPLOAD_TIMEOUT, capture=True)
+    except BridgeError as exc:
+        _trace_launch(session, {'event': 'stage-failed', 'remote': remote_basename,
+                                'seconds': round(time.monotonic() - started, 3),
+                                'error': _tail(str(exc), 2000),
+                                'note': '仅记 CLI 错误消息；源文件内容不入轨迹'})
+        raise
+    _trace_launch(session, {'event': 'stage', 'remote': remote_basename,
+                            'seconds': round(time.monotonic() - started, 3),
+                            **_completion_fields(r)})
+    _echo(r)
 
 
 def _staging_failed(session: str, starter_sent: bool) -> None:
@@ -680,11 +828,19 @@ def _staging_failed(session: str, starter_sent: bool) -> None:
         except BridgeError:
             pass
         if phase in WORKER_PHASES:
+            _trace_launch(session, {'event': 'staging-probe', 'phase': phase,
+                                    'status_tail': _tail(status, 800),
+                                    'note': 'worker 已确认启动：停止任何清理/停止动作；'
+                                            '接管交由 watch'})
             print(f'[mlbridge] 远端 worker 已启动 (phase={phase})；不停止实例。'
                   f'请用 mlbridge watch {session} 接管。', file=sys.stderr, flush=True)
             return
         # UNREACHABLE/UNKNOWN：传输未知 ≠ worker 未启动。starter 可能已在
         # 回复丢失前 spawn 了 worker；此时清理凭据或 stop 都可能误杀活任务。
+        _trace_launch(session, {'event': 'staging-probe', 'phase': phase,
+                                'status_tail': _tail(status, 800),
+                                'note': 'state 缺失只记 UNREACHABLE；不断言 VM 死亡；'
+                                        '不清理凭据、不停止实例'})
         print(f'[mlbridge] 状态探测不可达 (phase={phase})；不把传输未知当作 '
               'worker 未启动：starter 可能已在丢回复前启动 worker，'
               '因此不清理凭据、不停止实例。', file=sys.stderr, flush=True)
@@ -798,11 +954,20 @@ def launch(name: str, job: str, inputs: list[str], gpu: str | None = None,
             # 终态对账（无需重传 JSON）。legacy 记录字段保持不变。
             local_record['unit_batch_plan'] = plan
         store_local(session, local_record)
+        alloc_started = time.monotonic()
         try:
-            cli(*request, timeout=ALLOC_TIMEOUT)
-        except BridgeError:
+            r = cli(*request, timeout=ALLOC_TIMEOUT, capture=True)
+            _trace_launch(session, {'event': 'allocated',
+                                    'seconds': round(time.monotonic() - alloc_started, 3),
+                                    **_completion_fields(r)})
+            _echo(r)
+        except BridgeError as exc:
             # 分配失败不重试 new；对已确认未活跃的 session 尝试停止。
             # 查询与分配之间仍可能发生外部并发变更。
+            _trace_launch(session, {'event': 'alloc-failed',
+                                    'seconds': round(time.monotonic() - alloc_started, 3),
+                                    'error': _tail(str(exc), 2000),
+                                    'note': '不重试 new，不自动停止任何非本 session 实例'})
             try:
                 shutdown(session)
             except BridgeError:
@@ -889,10 +1054,10 @@ def launch(name: str, job: str, inputs: list[str], gpu: str | None = None,
                 print(f'[mlbridge] 本地 exec 显式超时 {timeout:.0f}s（观测上限：'
                       '超时仅作为观测中断处理，不判定远端失败；交 watch/对账）。',
                       flush=True)
-                result = exec_starter_once(
+                started_run = exec_starter_once(
                     session, starter_script('foreground'),
                     timeout=timeout, capture=True)
-                out = result.stdout or ''
+                out = started_run.completed.stdout or ''
                 if out:
                     print(out, end='' if out.endswith('\n') else '\n', flush=True)
                 exit_code = _foreground_exit_code(out)
@@ -907,7 +1072,24 @@ def launch(name: str, job: str, inputs: list[str], gpu: str | None = None,
                     _note_observation_lost(session, timeout)
             else:
                 # detached：短超时；CLI 超时/错误沿既有 _staging_failed 路径。
-                exec_starter_once(session, starter_script())
+                started_run = exec_starter_once(session, starter_script())
+            # remote PID 只是诊断线索（来自 starter 回显），两条路径都记录；
+            # 记录失败绝不改变发布语义。
+            if started_run.remote_pid is not None:
+                _trace_launch(session, {'event': 'starter-pid',
+                                        'remote_pid': started_run.remote_pid})
+                try:
+                    with _job_lock(session):
+                        record = get_local(session)
+                        record['remote_pid'] = started_run.remote_pid
+                        store_local(session, record)
+                except BridgeError:
+                    pass
+            else:
+                _trace_launch(session, {'event': 'starter-pid',
+                                        'remote_pid': None,
+                                        'note': 'starter 未回显可解析 PID'
+                                                '（不作为失败）'})
     except Exception as exc:
         # starter 前失败尝试停止；starter 后失败保留实例供检查。
         if foreground and isinstance(exc, ProcessTimeout):
