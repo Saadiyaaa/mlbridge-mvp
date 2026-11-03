@@ -23,6 +23,15 @@ class BridgeError(RuntimeError):
     pass
 
 
+class ProcessTimeout(BridgeError):
+    """本地子进程显式超时（仍是 BridgeError 子类，既有捕获不受影响）。
+
+    超时只说明本地命令在该时限内没有返回：**不构成任何关于远端结果
+    的证据**。例如 foreground exec 超时只意味着观测中断（远端 worker
+    可能仍在运行，也确实可能已被切断）；是否失败/中断交由后续 watch /
+    对账依据远端事实判定。"""
+
+
 def ident(value: str) -> str:
     if not IDENTITY.fullmatch(value):
         raise BridgeError("名称仅支持 1–63 位字母、数字、下划线、连字符")
@@ -169,7 +178,7 @@ def proc(cmd: list[str], *, cwd: Path | None = None,
         tail = (exc.stderr or exc.stdout or "").strip()
         raise BridgeError(f"命令失败({exc.returncode}): {cmd[0]} {tail[-650:]}") from exc
     except subprocess.TimeoutExpired as exc:
-        raise BridgeError(f"命令超时: {cmd[0]}") from exc
+        raise ProcessTimeout(f"命令超时: {cmd[0]}") from exc
 
 
 def secret_env(store: dict[str, str]) -> dict[str, str]:
@@ -287,8 +296,8 @@ def fetch(name: str, snapshot: str, *, target: Path | None = None,
     return root
 
 
-def _normalize_git_url(url: str) -> str:
-    # 仅做本地区分用的一致化：去尾斜杠和 .git 后缀，不做网络请求。
+def normalize_git_url(url: str) -> str:
+    """URL 一致化：去首尾空白、尾斜杠和 .git 后缀，不做网络请求。"""
     url = url.strip().rstrip("/")
     if url.endswith(".git"):
         url = url[:-len(".git")]
@@ -335,7 +344,7 @@ def check_git_pushed(root: Path, repository: str | None = None) -> None:
             raise BridgeError(
                 f"无法读取 git remote {remote} 的 URL；"
                 f"本地无法证明提交已推送到配置的仓库 {repository}") from exc
-        if _normalize_git_url(actual) != _normalize_git_url(repository):
+        if normalize_git_url(actual) != normalize_git_url(repository):
             raise BridgeError(
                 f"项目配置的 repository 是 {repository}，但当前分支的上游是 "
                 f"git remote {remote} ({actual})；本地无法证明提交已推送到配置的仓库。"

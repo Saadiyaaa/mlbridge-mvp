@@ -10,9 +10,10 @@ from pathlib import Path
 from . import __version__
 from .colab_runner import get_local, get_status, launch, logs, shutdown, watch
 from .ssh_observe import ssh_observe
-from .core import (BridgeError, config_dir, expand, fetch, new_settings,
-                   proc, project, publish, register, repo_url, restic,
-                   secret_env, settings, restic_overwrite_supported)
+from .core import (BridgeError, config_dir, expand, fetch, git_commit,
+                   job_spec, new_settings, proc, project, publish, register,
+                   repo_url, restic, secret_env, settings,
+                   restic_overwrite_supported)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -47,6 +48,22 @@ def parser() -> argparse.ArgumentParser:
                    help='单实例守卫：分配前用 `colab sessions` 核对活跃实例数，超过则拒绝（不做任何清理）。'
                         '默认读 settings.toml [colab].max_active_sessions（缺省 1）；0 只关闭并发上限检查，'
                         '复用已在 colab 活跃的 --session 名仍会被 fail-closed 拒绝')
+    x.add_argument('--unit-batch', metavar='FILE', default=None,
+                   help='批模式（opt-in）：从版本化批定义 JSON 依次运行一组工作单元'
+                        '（schema 见 docs/RECOVERY.md）；恢复对账/逐单元状态查询见 '
+                        '`mlbridge units <project>`。未给出时 legacy run 行为完全不变')
+    x.add_argument('--retry-failed', action='store_true',
+                   help='批模式专用：对台账中已确定失败(task_failed)或已诚实放弃'
+                        '(execution_abandoned)的单元显式开起新 attempt '
+                        '重跑；默认不自动重试（未确定证据的未决单元不受此参数影响）')
+    x.add_argument('--execution-mode', choices=['detached', 'foreground'],
+                   default='detached',
+                   help='批模式交付方式（不改变台账语义，不参与批次身份）：'
+                        'detached=缺省，cell 内分离启动 worker，代价是可能被平台回收；'
+                        'foreground=worker 在 cell 内同步运行到批结束，平台能观测到'
+                        '真实持续执行，代价是本地连接断开/超时可能随 cell 中断执行；'
+                        '任一模式都不承诺成功。foreground 的本地 exec 带显式长超时，'
+                        '超时仅作为观测中断处理（交 watch/对账判定）')
     x.add_argument('--detach', action='store_true', help='不等待；之后用 watch 监视/自动停止')
     x.add_argument('--allow-dirty', action='store_true', help='使用 HEAD，忽略本地未提交代码变更')
     x.add_argument('--allow-empty-input', action='store_true', help='明确确认该任务无需输入快照')
@@ -59,12 +76,97 @@ def parser() -> argparse.ArgumentParser:
     x.add_argument('--no-stop', action='store_true')
     x = sub.add_parser('stop', help='手动释放 session（如果未发布输出，可能丢失数据）')
     x.add_argument('session')
+    x = sub.add_parser('units', help='只读查询：项目台账中每个单元的状态 / attempt / 成果')
+    x.add_argument('project'); x.add_argument('--json', action='store_true')
     x = sub.add_parser('ssh', help='SSH 单次读取既有实例的系统状态；支持自定义远端命令，不创建/停止实例')
     x.add_argument('session')
     x.add_argument('--timeout', type=int, default=60, help='连接与执行的总秒数（5–3600）')
     x.add_argument('--identity', help='已有的 ed25519/ecdsa 私钥路径（默认先检查 MLBridge 配置目录 ssh/id_ed25519）')
     x.add_argument('command', nargs=argparse.REMAINDER, help='可选：-- 后接远端命令及参数；不填则输出系统快照')
     return p
+
+
+def _run_batch_cli(args) -> int:
+    """批模式 `run --unit-batch` 的 CLI 编排（全部校验/对账在 GPU 分配前）。
+
+    拆分为独立辅助函数，使 legacy `run` 路径逐字节不变。顺序：
+    配置解析（与 legacy 同一 commit/仓库规则）→ batch_control 全部
+    预校验与恢复对账 → on_launch(launch → 含 `colab new` → 台账对齐
+    窗口 → staging) → watch(批终态逐单元对账)。"""
+    if args.input:
+        raise BridgeError('--input 与 --unit-batch 互斥：批输入来自 unit spec 的'
+                          '显式快照 id（plan.inputs 顺序 = 名称排序后快照）')
+    from .batch_control import run_batch as _run_batch
+    name = args.project
+    cfg = project(name)
+    store = settings()
+    spec = job_spec(cfg, args.job)       # 批模式只取 job.setup（legacy 契约）
+    commit = git_commit(expand(cfg['workspace']), args.allow_dirty,
+                        repository=cfg['repository'])
+    namespace = repo_url(name, store)
+
+    def on_launch(plan, attempt_by_uid):
+        on_assign, on_assign_abort = _make_on_assign(plan, attempt_by_uid)
+        session = launch(name, args.job, args.input, args.gpu,
+                         high_mem=args.high_mem, allow_dirty=args.allow_dirty,
+                         session=args.session, allow_empty_input=False,
+                         max_active_sessions=args.max_active_sessions,
+                         unit_batch=plan,
+                         on_assign=on_assign,
+                         on_assign_abort=on_assign_abort)
+        print('批任务已独立启动，session:', session, flush=True)
+        print(f'调试：colab ssh -s {session} （不要用 --rm）', flush=True)
+        if args.detach:
+            print(f'稍后执行 mlbridge watch {session}（批模式：自动从本地记录'
+                  '读取批计划逐单元对账）；完成且全部确定成功时才自动释放。',
+                  flush=True)
+            return session, None
+        print('监视状态直到完成（批模式：终态后按逐单元对账，只有全部单元'
+              '确定成功才自动 stop）；Ctrl-C 不会故意停止远端训练。', flush=True)
+        result = watch(session, batch_plan=plan)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return session, result
+
+    outcome = _run_batch(project_name=name, batch_file=Path(args.unit_batch),
+                         commit=commit, repository=cfg['repository'],
+                         setup=spec['setup'], restic_namespace=namespace,
+                         retry_failed=args.retry_failed,
+                         execution_mode=args.execution_mode, on_launch=on_launch)
+    report = outcome['report']
+    print(f'批模式 batch_id={report["batch_id"]} '
+          f'allocated={report["allocated"]}')
+    print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+    if report['allocated']:
+        result = outcome.get('result')
+        if result is None:
+            return 0  # --detach：实例已占用，状态由后续 watch 对账
+        summary = result.get('batch_reconcile') or {}
+        if not summary.get('all_resolved_succeeded') or result.get('stop_error'):
+            return 1
+    # 零实例报告（全部单元已完成）退出码 0。
+    return 0
+
+
+def _make_on_assign(plan, attempt_by_uid):
+    """launch 在 `colab new` 成功后、staging 前调用的台账对齐回调。
+
+    返回 (on_assign, on_assign_abort)：后者仅在 launch 已尽力停止实例
+    **且确认停止成功** 后被调用，为对齐窗口内已写入的 attempt 写控制器
+    本地事实证据（绝不伪造远端终态；stop 未确认时 launch 不会调用它）。"""
+    from .batch_control import record_alignment_abort, start_batch_attempts
+
+    def on_assign(session):
+        start_batch_attempts(plan, attempt_by_uid, session)
+
+    def on_assign_abort(session):
+        summary = record_alignment_abort(plan["project"], attempt_by_uid,
+                                         session)
+        if summary["attempts_recorded"]:
+            print('[mlbridge] 对齐中止证据已写入台账（attempt='
+                  + ','.join(summary["attempts_recorded"]) + '）；'
+                  '重跑该 unit 需 --retry-failed。', file=sys.stderr,
+                  flush=True)
+    return on_assign, on_assign_abort
 
 
 def execute(args):
@@ -127,6 +229,14 @@ def execute(args):
             print(json.dumps({'id': obj.get('id'), 'time': obj.get('time'),
                               'tags': obj.get('tags')}, ensure_ascii=False))
     elif a == 'run':
+        if args.unit_batch is not None:
+            return _run_batch_cli(args)
+        if args.retry_failed:
+            raise BridgeError('--retry-failed 仅在 --unit-batch 批模式有效')
+        if args.execution_mode != 'detached':
+            # 台账语义不因 execution_mode 改变：legacy 一律拒绝非缺省值。
+            raise BridgeError('--execution-mode 仅在 --unit-batch 批模式有效'
+                              '（foreground 仅批模式允许）')
         session = launch(args.project, args.job, args.input, args.gpu,
                          high_mem=args.high_mem, allow_dirty=args.allow_dirty, session=args.session,
                          allow_empty_input=args.allow_empty_input,
@@ -157,10 +267,23 @@ def execute(args):
     elif a == 'logs':
         logs(args.session, lines=args.lines)
     elif a == 'watch':
-        result = watch(args.session, interval=args.interval, auto_stop=not args.no_stop)
+        # 批模式：本地任务记录携带远端批计划，据此逐单元对账终态。
+        try:
+            batch_plan = get_local(args.session).get('unit_batch_plan')
+        except BridgeError:
+            batch_plan = None
+        result = watch(args.session, interval=args.interval,
+                       auto_stop=not args.no_stop, batch_plan=batch_plan)
         print(json.dumps(result, ensure_ascii=False, indent=2))
+        summary = result.get('batch_reconcile')
+        if summary is not None and not summary.get('all_resolved_succeeded'):
+            return 1
         if result.get('phase') != 'SUCCEEDED' or result.get('stop_error'):
             return 1
+    elif a == 'units':
+        from .batch_control import format_units_report, to_json, units_report
+        report = units_report(args.project)
+        print(to_json(report) if args.json else format_units_report(report))
     elif a == 'stop':
         shutdown(args.session)
         print('Colab session 已停止:', args.session)
