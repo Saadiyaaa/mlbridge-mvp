@@ -988,7 +988,7 @@ def run_batch(*, project_name: str, batch_file: Path, commit: str,
     """批模式编排；on_launch(parsed, attempt_by_uid) 由 CLI 注入真正
     launch/watch 流程，签名约定见 cli 批分支。
 
-    execution_mode 只改变交付/生命周期（detached 分离启动 = 缺省旧行为；
+    execution_mode 只改变交付/生命周期（detached 分离启动 = 缺省；
     foreground 仅批模式、cell 内同步运行），**不参与 batch_id 身份**，
     不改变台账语义：跨模式重入同一批次的恢复对账一致。
 
@@ -1030,7 +1030,7 @@ def run_batch(*, project_name: str, batch_file: Path, commit: str,
             "unit_batch": content, "restic_namespace": parsed["restic_namespace"],
             "batch_id": parsed["batch_id"]}
     if execution_mode == "foreground":
-        # detached（缺省）不写入该键，与旧计划/载荷保持一致。
+        # detached（缺省）不写入该键。
         plan["execution_mode"] = "foreground"
     session, result = on_launch(plan, attempt_by_uid)
     report = {

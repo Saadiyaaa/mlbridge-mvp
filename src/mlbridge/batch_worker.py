@@ -1,4 +1,4 @@
-"""远端批（unit_batch）执行器 v1：随 remote_worker 上传的 standalone 模块。
+"""远端批（unit_batch）执行器：随 remote_worker 上传的 standalone 模块。
 
 限定与边界（先读齐本文档再扩展接口；详细说明见 docs/UNIT_EXECUTION.md）：
 - 纯 stdlib，不 import mlbridge 包、不需要 pip；由 `mlbridge run
@@ -549,7 +549,7 @@ def _check_batch_invariants(items: list[dict[str, Any]],
 
 
 def validate_batch(plan: Any) -> dict[str, Any]:
-    """批计划 v1 纯校验；返回 executor 消费的规范化批上下文。
+    """批计划 v2 纯校验；返回 executor 消费的规范化批上下文。
 
     该函数绝不触碰文件系统/子进程/网络；validate 通过前，调用方不得
     执行 clone/restore/setup 等任何副作用（fail closed 契约）。
@@ -610,7 +610,7 @@ def validate_batch(plan: Any) -> dict[str, Any]:
 # batch 状态记录（同批重复 worker 拒绝 + 逐单元进度）
 # ---------------------------------------------------------------------------
 # 跨进程互斥由调用方 remote_worker 全程持有的 BASE 执行锁提供；本模块
-# 的所有写函数必须在所有权内调用。claim 不再自建锁：重复 worker 优先
+# 的所有写函数必须在所有权内调用。重复 worker 优先
 # 在锁处非阻塞拒绝，claim 只拒绝“同 batch 已有运行/终态记录”。
 
 

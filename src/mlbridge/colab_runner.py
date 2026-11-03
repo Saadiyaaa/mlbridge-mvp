@@ -28,7 +28,7 @@ SESSION = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$')
 
 # execution_mode（plan 级，缺省 detached）：仅 'foreground' 在批模式下
 # 进入 foreground starter 分支（job 载荷中写 plan['execution_mode']=
-# 'foreground'；detached 不写入，与旧载荷逐字节一致，legacy 拒绝 foreground）。
+# 'foreground'；detached 不写入，legacy 拒绝 foreground）。
 EXECUTION_MODES = ('detached', 'foreground')
 
 # foreground cell 内同步执行结束的哨兵行：本地 exec 正常返回（含该哨兵）
@@ -512,7 +512,7 @@ def prepare_script() -> str:
 def starter_script(execution_mode: str = 'detached') -> str:
     """starter 脚本：按 execution_mode 选“分离”或“前台”。
 
-    detached（缺省，旧行为逐字节不变）：cell 内 Popen(start_new_session)
+    detached（缺省）：cell 内 Popen(start_new_session)
     分离启动 remote_worker 后 cell 立即结束；worker 独立于 SSH/exec
     生命周期，代价是平台可能回收实例。
 
@@ -879,8 +879,7 @@ def launch(name: str, job: str, inputs: list[str], gpu: str | None = None,
     secret_env(store)
     if unit_batch is not None:
         # 批模式（opt-in）：计划已由 CLI 层在分配前完整预校验；这里只
-        # 接受完全解析后的绑定（inputs/setup/commit 不再走 legacy job
-        # 解析），并确保 batch_worker.py 存在（缺文件 fail closed，在
+        # 接受完全解析后的绑定（inputs/setup/commit 使用批计划解析），并确保 batch_worker.py 存在（缺文件 fail closed，在
         # 任何分配之前拒绝）。
         if not isinstance(unit_batch, dict) or not isinstance(
                 unit_batch.get('unit_batch'), dict):
@@ -921,7 +920,7 @@ def launch(name: str, job: str, inputs: list[str], gpu: str | None = None,
                 restic_repository=repo_url(name, store),
                 inputs=inputs, **spec)
     if foreground:
-        # detached（缺省）不写入该键：旧 legacy/批载荷逐字节不变。
+        # detached（缺省）不写入该键。
         plan['execution_mode'] = 'foreground'
     if unit_batch is not None:
         # 批 JSON 契约：随 job.json 之上的 plan['unit_batch']（字段名与

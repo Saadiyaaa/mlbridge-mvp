@@ -1,4 +1,4 @@
-# 远端工作单元顺序执行（unit_batch v1）——当前接口、限制与验收责任
+# 远端工作单元顺序执行（unit_batch v2）——当前接口、限制与验收责任
 
 本文档描述远端 worker 的 `unit_batch` 批模式当前能力：所有权、顺序执行、
 逐单元验证/发布/回执与终态写法。先读边界：
@@ -27,7 +27,7 @@
 - `src/mlbridge/remote_worker.py`：入口与**唯一所有权原语**。plan 中
   `unit_batch` **键存在**（含显式 null）即走批模式校验——显式 null 是
   非法批计划，在任何 clone/restore/setup 副作用之前被拒绝；无该键的
-  legacy plan 完全照旧。
+  legacy plan 使用单任务执行路径。
 - `src/mlbridge/protocol.py`：unit 身份的权威定义。batch_worker 在远端
   **本地镜像**同一条规范化/校验规则并独立重算 canonical SHA256，绝不
   信任提交方给出的哈希；镜像一致性由
@@ -202,8 +202,8 @@ session / files{相对路径: SHA256}`。
 
 ## 状态/进度
 
-`/content/mlbridge_state.json` 仍是本地 watch 的视图；`phase` 语义不变
-（PREPARING/RESTORING/RUNNING/PUBLISHING/终态），新增 `batch` 字段：
+`/content/mlbridge_state.json` 是本地 watch 的视图；`phase` 为
+PREPARING/RESTORING/RUNNING/PUBLISHING/终态，`batch` 字段为：
 `batch_id / session / units_total / current_unit / outcomes`。
 `/content/mlbridge_batch_state_<batch_id>.json` 是该批的持久进度记录
 （claim 即创建；逐单元 outcome 补齐全量 unit、未启动者保持
@@ -212,11 +212,11 @@ NOT_STARTED；crash 后仍保留，供同批 dup 拒绝与人工对账）。
 
 ## 交付模式与生命周期成本（execution_mode v1）
 
-`plan['execution_mode']`（plan 级键，可选）：缺省/`'detached'` = 旧行为；
+`plan['execution_mode']`（plan 级键，可选）：缺省/`'detached'` = 分离执行；
 `'foreground'` = cell 内同步执行（**仅批模式允许**；任何 legacy plan 带
 该值、或非法值，都会在任何副作用（含心跳）之前被
 `remote_worker.validate_execution_mode` 拒绝）。detached 时该键不写入
-job 载荷（与现有载荷逐字节一致）。
+job 载荷。
 
 - **detached（缺省）**：starter 在 cell 内 `Popen(start_new_session)`
   分离启动 worker 后 cell 立即结束；exec 秒级返回，worker 独立于

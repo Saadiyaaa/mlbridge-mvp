@@ -245,8 +245,8 @@ def restore_args(mode: str = 'always') -> list[str]:
     return []
 
 
-# plan 级 execution_mode（v1）：缺省/ 'detached' = 旧行为（starter 在
-# cell 内 Popen 分离启动 worker）；'foreground' = cell 内同步运行。
+# plan 级 execution_mode（v1）：缺省/ 'detached' = starter 在
+# cell 内 Popen 分离启动 worker；'foreground' = cell 内同步运行。
 _EXECUTION_MODES = ('detached', 'foreground')
 
 
@@ -254,7 +254,7 @@ def validate_execution_mode(plan: object) -> str:
     """校验 plan 级 execution_mode；在任何副作用（含心跳启动与执行锁内
     的任何写入）之前 fail closed。
 
-    - 键缺失或 'detached'：与旧行为逐字节一致（legacy 与批皆可），
+    - 键缺失或 'detached'：legacy 与批皆可，
       job 载荷中不写入该键。
     - 'foreground'：仅批模式（plan 含 unit_batch 对象）允许；cell 内
       同步运行 worker，本地 exec 连接断开/超时可能随 cell 终止执行。
@@ -500,10 +500,10 @@ def _run_legacy(plan):
 
 
 def _run_batch(plan):
-    """unit_batch v1 顺序执行切片：validate（纯校验）→ claim（同批重复
+    """unit_batch 顺序执行：validate（纯校验）→ claim（同批重复
     终态/运行记录拒绝）→ 一次 clone/restore/setup → 逐 unit 执行/发布/回执。
 
-    进程间互斥由 main 持有的 BASE 执行锁提供（全程）；本函数不再自建锁。
+    进程间互斥由 main 持有的 BASE 执行锁提供（全程）；本函数使用该锁。
     validate_batch 是纯校验：任何 schema/身份/绑定非法（含显式 null 的
     unit_batch）都在任何副作用（包括凭据 chmod 与 clone）之前被拒绝。
     终态由 executor 写入；main 的兜底只补写身份可确认、executor 未成功
